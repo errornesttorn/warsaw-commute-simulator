@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	simpkg "github.com/errornesttorn/mini-traffic-simulation-core"
@@ -26,11 +27,16 @@ const (
 	lightHeadSize = 0.45
 	pedHeight     = 1.75
 	pedWidth      = 0.5
+
+	terrainMeshMaxDim    = 512
+	terrainTextureMaxDim = 4096
 )
 
 type App struct {
 	world         *simpkg.World
 	loaded        bool
+	terrain       *terrainData
+	mapName       string
 	camPos        rl.Vector3
 	yaw           float32
 	pitch         float32
@@ -52,6 +58,7 @@ func main() {
 		unitCube:      rl.LoadModelFromMesh(rl.GenMeshCube(1, 1, 1)),
 	}
 	defer rl.UnloadModel(app.unitCube)
+	defer func() { unloadTerrain(app.terrain) }()
 
 	for !rl.WindowShouldClose() {
 		app.update()
@@ -74,7 +81,7 @@ func (a *App) update() {
 	}
 
 	if (rl.IsKeyDown(rl.KeyLeftControl) || rl.IsKeyDown(rl.KeyRightControl)) && rl.IsKeyPressed(rl.KeyO) {
-		a.openScenario()
+		a.openMap()
 	}
 
 	if a.loaded {
@@ -131,7 +138,11 @@ func (a *App) draw() {
 	rl.ClearBackground(rl.NewColor(30, 30, 40, 255))
 
 	rl.BeginMode3D(a.buildCamera())
-	rl.DrawGrid(200, 1.0)
+	if a.terrain != nil {
+		rl.DrawModel(a.terrain.model, a.terrain.position, 1, rl.White)
+	} else {
+		rl.DrawGrid(200, 1.0)
+	}
 
 	if a.loaded {
 		a.drawPedestrianPaths()
@@ -167,9 +178,11 @@ func (a *App) drawSplines() {
 		if s.BusOnly {
 			col = rl.NewColor(80, 160, 255, 255)
 		}
-		prev := sim2world(s.Samples[0])
+		prev := a.sim2world(s.Samples[0])
+		prev.Y += 0.05
 		for i := 1; i < len(s.Samples); i++ {
-			cur := sim2world(s.Samples[i])
+			cur := a.sim2world(s.Samples[i])
+			cur.Y += 0.05
 			rl.DrawLine3D(prev, cur, col)
 			prev = cur
 		}
@@ -189,7 +202,7 @@ func (a *App) drawPedestrianPaths() {
 		cx := (p.P0.X + p.P1.X) / 2
 		cz := (p.P0.Y + p.P1.Y) / 2
 		size := rl.NewVector3(simpkg.PedestrianPathWidthM, 0.04, length)
-		a.drawBox(rl.NewVector3(cx, groundY+0.02, cz), size, angle, col)
+		a.drawBox(rl.NewVector3(cx, a.groundAt(cx, cz)+0.02, cz), size, angle, col)
 	}
 }
 
@@ -198,12 +211,13 @@ func (a *App) drawTrafficLights() {
 		px := light.WorldPos.X
 		pz := light.WorldPos.Y
 
+		ground := a.groundAt(px, pz)
 		// Pole
-		poleCenter := rl.NewVector3(px, groundY+poleHeight/2, pz)
+		poleCenter := rl.NewVector3(px, ground+poleHeight/2, pz)
 		rl.DrawCubeV(poleCenter, rl.NewVector3(0.15, poleHeight, 0.15), rl.DarkGray)
 
 		// Light head
-		headY := float32(groundY + poleHeight + lightHeadSize/2)
+		headY := float32(ground + poleHeight + lightHeadSize/2)
 		col := a.trafficLightColor(light)
 		rl.DrawCubeV(rl.NewVector3(px, headY, pz), rl.NewVector3(lightHeadSize, lightHeadSize, lightHeadSize), col)
 	}
@@ -232,11 +246,14 @@ func (a *App) drawCars() {
 		length := car.Length
 		width := car.Width
 
+		ground := a.groundAt(cx, cz)
+		pitchDeg, rollDeg := a.terrainTilt(cx, cz, hx, hz, length, width)
+
 		c := car.Color
-		a.drawBox(
-			rl.NewVector3(cx, groundY+h/2, cz),
+		a.drawOrientedBox(
+			rl.NewVector3(cx, ground+h/2, cz),
 			rl.NewVector3(width, h, length),
-			angle,
+			angle, pitchDeg, rollDeg,
 			rl.NewColor(c.R, c.G, c.B, 255),
 		)
 
@@ -247,12 +264,18 @@ func (a *App) drawCars() {
 			tdx := rearX - trX
 			tdz := rearZ - trZ
 			trailerAngle := float32(math.Atan2(float64(tdx), float64(tdz))) * 180 / math.Pi
-			trailerCenter := rl.NewVector3((rearX+trX)/2, groundY+h/2, (rearZ+trZ)/2)
+			thx := float32(math.Sin(float64(trailerAngle) * math.Pi / 180))
+			thz := float32(math.Cos(float64(trailerAngle) * math.Pi / 180))
+			tcx := (rearX + trX) / 2
+			tcz := (rearZ + trZ) / 2
+			tGround := a.groundAt(tcx, tcz)
+			tPitch, tRoll := a.terrainTilt(tcx, tcz, thx, thz, car.Trailer.Length, car.Trailer.Width)
+			trailerCenter := rl.NewVector3(tcx, tGround+h/2, tcz)
 			tc := car.Trailer.Color
-			a.drawBox(
+			a.drawOrientedBox(
 				trailerCenter,
 				rl.NewVector3(car.Trailer.Width, h, car.Trailer.Length),
-				trailerAngle,
+				trailerAngle, tPitch, tRoll,
 				rl.NewColor(tc.R, tc.G, tc.B, 255),
 			)
 		}
@@ -265,17 +288,17 @@ func (a *App) drawCars() {
 			halfLen := length/2 - 0.2
 			halfWid := width/2 + 0.05
 			indSize := rl.NewVector3(0.25, 0.25, 0.05)
-			indY := groundY + h*0.7
+			indY := ground + h*0.7
 
 			if car.TurnSignal == simpkg.TurnSignalLeft {
 				// left = -right
 				ix := cx + hx*halfLen + (-rx)*halfWid
 				iz := cz + hz*halfLen + (-rz)*halfWid
-				a.drawBox(rl.NewVector3(ix, indY, iz), indSize, angle, amber)
+				a.drawOrientedBox(rl.NewVector3(ix, indY, iz), indSize, angle, pitchDeg, rollDeg, amber)
 			} else {
 				ix := cx + hx*halfLen + rx*halfWid
 				iz := cz + hz*halfLen + rz*halfWid
-				a.drawBox(rl.NewVector3(ix, indY, iz), indSize, angle, amber)
+				a.drawOrientedBox(rl.NewVector3(ix, indY, iz), indSize, angle, pitchDeg, rollDeg, amber)
 			}
 		}
 	}
@@ -314,7 +337,7 @@ func (a *App) drawPedestrians() {
 			pz = path.P0.Y + ndz*ped.Distance + perpZ*ped.LateralOffset
 		}
 
-		center := rl.NewVector3(px, groundY+pedHeight/2, pz)
+		center := rl.NewVector3(px, a.groundAt(px, pz)+pedHeight/2, pz)
 		rl.DrawCubeV(center, rl.NewVector3(pedWidth, pedHeight, pedWidth*0.8), skinColor)
 	}
 }
@@ -325,8 +348,12 @@ func (a *App) drawHUD() {
 	w := int32(rl.GetScreenWidth())
 	h := int32(rl.GetScreenHeight())
 
-	if !a.loaded {
-		msg := "Press Ctrl+O to open a scenario"
+	if a.terrain == nil {
+		msg := "Press Ctrl+O to open a map folder (map.json)"
+		tw := rl.MeasureText(msg, 20)
+		rl.DrawText(msg, w/2-tw/2, h/2-10, 20, rl.White)
+	} else if !a.loaded {
+		msg := fmt.Sprintf("Map %q loaded — no simulation referenced", a.mapName)
 		tw := rl.MeasureText(msg, 20)
 		rl.DrawText(msg, w/2-tw/2, h/2-10, 20, rl.White)
 	}
@@ -356,6 +383,76 @@ func (a *App) drawBox(pos, size rl.Vector3, yawDeg float32, color rl.Color) {
 	rl.DrawModelEx(a.unitCube, pos, rl.NewVector3(0, 1, 0), yawDeg, size, color)
 }
 
+// drawOrientedBox draws the unit cube with yaw + pitch + roll (degrees).
+// Pitch rotates around the car's right axis (nose up/down), roll around
+// the forward axis (lateral tilt). Falls back to the simple path when there
+// is no tilt.
+func (a *App) drawOrientedBox(pos, size rl.Vector3, yawDeg, pitchDeg, rollDeg float32, tint rl.Color) {
+	if pitchDeg == 0 && rollDeg == 0 {
+		a.drawBox(pos, size, yawDeg, tint)
+		return
+	}
+
+	const deg2rad = float32(math.Pi / 180.0)
+	scaleM := rl.MatrixScale(size.X, size.Y, size.Z)
+	rollM := rl.MatrixRotate(rl.NewVector3(0, 0, 1), rollDeg*deg2rad)
+	pitchM := rl.MatrixRotate(rl.NewVector3(1, 0, 0), pitchDeg*deg2rad)
+	yawM := rl.MatrixRotate(rl.NewVector3(0, 1, 0), yawDeg*deg2rad)
+	transM := rl.MatrixTranslate(pos.X, pos.Y, pos.Z)
+
+	// raylib's MatrixMultiply(A, B) returns B*A in math, so each call stacks
+	// the next step on the LEFT. Desired application order on a local vertex
+	// (innermost first): scale, roll, pitch, yaw, translate.
+	m := scaleM
+	m = rl.MatrixMultiply(m, rollM)
+	m = rl.MatrixMultiply(m, pitchM)
+	m = rl.MatrixMultiply(m, yawM)
+	m = rl.MatrixMultiply(m, transM)
+
+	meshes := a.unitCube.GetMeshes()
+	materials := a.unitCube.GetMaterials()
+	if len(meshes) == 0 || len(materials) == 0 {
+		return
+	}
+	mapPtr := materials[0].GetMap(int32(rl.MapAlbedo))
+	old := mapPtr.Color
+	mapPtr.Color = tint
+	rl.DrawMesh(meshes[0], materials[0], m)
+	mapPtr.Color = old
+}
+
+// terrainTilt returns (pitchDeg, rollDeg) so a box centred at (cx,cz) with the
+// given heading and footprint conforms to the terrain surface. Returns (0,0)
+// when no terrain is loaded.
+func (a *App) terrainTilt(cx, cz, hx, hz, length, width float32) (float32, float32) {
+	if a.terrain == nil {
+		return 0, 0
+	}
+	halfLen := length * 0.4
+	halfWid := width * 0.4
+	if halfLen < 0.2 {
+		halfLen = 0.2
+	}
+	if halfWid < 0.2 {
+		halfWid = 0.2
+	}
+
+	hFront := terrainHeightAtLocal(a.terrain, cx+hx*halfLen, cz+hz*halfLen)
+	hBack := terrainHeightAtLocal(a.terrain, cx-hx*halfLen, cz-hz*halfLen)
+	// right-of-heading in XZ (clockwise from above)
+	rx, rz := hz, -hx
+	hRight := terrainHeightAtLocal(a.terrain, cx+rx*halfWid, cz+rz*halfWid)
+	hLeft := terrainHeightAtLocal(a.terrain, cx-rx*halfWid, cz-rz*halfWid)
+
+	// Pitch: +θ around world +X sends local +Z to -Y (right-hand rule), so
+	// negate to make positive pitch = nose up.
+	pitch := -math.Atan2(float64(hFront-hBack), float64(2*halfLen))
+	// Roll: +θ around world +Z sends local +X to +Y, so positive roll = right
+	// side up when the terrain rises to the right.
+	roll := math.Atan2(float64(hRight-hLeft), float64(2*halfWid))
+	return float32(pitch * 180 / math.Pi), float32(roll * 180 / math.Pi)
+}
+
 func (a *App) trafficLightColor(light simpkg.TrafficLight) rl.Color {
 	for i := range a.world.TrafficCycles {
 		c := &a.world.TrafficCycles[i]
@@ -379,37 +476,63 @@ func (a *App) trafficLightColor(light simpkg.TrafficLight) rl.Color {
 	return rl.DarkGray
 }
 
-func (a *App) openScenario() {
+func (a *App) openMap() {
 	rl.EnableCursor()
-	path, err := pickFilePath()
+	path, err := pickMapPath()
 	rl.DisableCursor()
 	a.mouseCaptured = true
 	if err != nil || path == "" {
 		return
 	}
-	w, err := simpkg.LoadWorld(path)
+
+	mapDef, err := loadMapDefinition(path)
 	if err != nil {
-		fmt.Printf("Failed to load scenario: %v\n", err)
+		fmt.Printf("Failed to load map: %v\n", err)
 		return
 	}
-	a.world = w
-	a.loaded = true
 
-	if len(w.Splines) > 0 {
-		var sumX, sumZ float32
-		var count float32
-		for _, s := range w.Splines {
-			sumX += s.P0.X + s.P3.X
-			sumZ += s.P0.Y + s.P3.Y
-			count += 2
-		}
-		a.camPos = rl.NewVector3(sumX/count, 50, sumZ/count)
-		a.pitch = -45
+	terrain, err := loadTerrain(mapDef, terrainMeshMaxDim, terrainTextureMaxDim)
+	if err != nil {
+		fmt.Printf("Failed to build terrain: %v\n", err)
+		return
 	}
+
+	unloadTerrain(a.terrain)
+	a.terrain = terrain
+	a.mapName = mapDef.Name
+	a.world = nil
+	a.loaded = false
+
+	if mapDef.Simulation != "" {
+		simPath := filepath.Join(filepath.Dir(mapDef.ManifestPath), mapDef.Simulation)
+		if w, err := simpkg.LoadWorld(simPath); err == nil {
+			a.world = w
+			a.loaded = true
+		} else {
+			fmt.Printf("Map loaded, but simulation %s failed: %v\n", mapDef.Simulation, err)
+		}
+	}
+
+	// Camera: centre over the terrain at a reasonable height.
+	cx := terrain.position.X + terrain.widthMeters*0.5
+	cz := terrain.position.Z + terrain.depthMeters*0.5
+	ground := terrainHeightAtLocal(terrain, cx, cz)
+	a.camPos = rl.NewVector3(cx, ground+80, cz+terrain.depthMeters*0.4)
+	a.pitch = -35
+	a.yaw = 0
 }
 
-func sim2world(v simpkg.Vec2) rl.Vector3 {
-	return rl.NewVector3(v.X, groundY, v.Y)
+func (a *App) sim2world(v simpkg.Vec2) rl.Vector3 {
+	return rl.NewVector3(v.X, a.groundAt(v.X, v.Y), v.Y)
+}
+
+// groundAt returns the raylib Y height at sim (x, y) — i.e. raylib (x, z).
+// When no terrain is loaded, this is groundY.
+func (a *App) groundAt(simX, simY float32) float32 {
+	if a.terrain == nil {
+		return groundY
+	}
+	return terrainHeightAtLocal(a.terrain, simX, simY)
 }
 
 func addVec3(a, b rl.Vector3) rl.Vector3 {
@@ -420,10 +543,11 @@ func scaleVec3(v rl.Vector3, s float32) rl.Vector3 {
 	return rl.NewVector3(v.X*s, v.Y*s, v.Z*s)
 }
 
-func pickFilePath() (string, error) {
+func pickMapPath() (string, error) {
 	out, err := exec.Command("zenity",
-		"--file-selection", "--title=Open scenario",
-		"--file-filter=Scenario files | *.json",
+		"--file-selection", "--title=Open map folder",
+		"--filename=map.json",
+		"--file-filter=Map manifest | map.json",
 	).Output()
 	if err != nil {
 		return "", err
