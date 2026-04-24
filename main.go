@@ -17,7 +17,7 @@ const (
 	screenW    = 1280
 	screenH    = 720
 	moveSpeed  = 20.0
-	sprintMult = 3.0
+	sprintMult = 6.0
 	mouseSens  = 0.2
 	groundY    = 0.0
 
@@ -225,18 +225,17 @@ func (a *App) drawTrafficLights() {
 
 func (a *App) drawCars() {
 	allSplines := simpkg.MergedSplines(a.world.Splines, a.world.LaneChangeSplines)
-	blinkOn := int(rl.GetTime()*2) % 2 == 0
+	blinkOn := int(rl.GetTime()*2)%2 == 0
 	amber := rl.NewColor(255, 165, 0, 255)
 
 	for _, car := range a.world.Cars {
-		spline, ok := simpkg.FindSplineByID(allSplines, car.CurrentSplineID)
+		frontPos, center, heading, ok := carBodyPose(car, allSplines)
 		if !ok {
 			continue
 		}
-		pos2, heading2 := simpkg.SampleSplineAtDistance(spline, car.DistanceOnSpline)
 
-		cx, cz := pos2.X, pos2.Y
-		hx, hz := heading2.X, heading2.Y
+		cx, cz := center.X, center.Y
+		hx, hz := heading.X, heading.Y
 		angle := float32(math.Atan2(float64(hx), float64(hz))) * 180 / math.Pi
 
 		h := float32(carHeight)
@@ -285,23 +284,63 @@ func (a *App) drawCars() {
 			// right-of-car in 3D: perpendicular clockwise to heading
 			// heading (hx,hz) → right = (hz, 0, -hx) in world
 			rx, rz := hz, -hx
-			halfLen := length/2 - 0.2
 			halfWid := width/2 + 0.05
 			indSize := rl.NewVector3(0.25, 0.25, 0.05)
 			indY := ground + h*0.7
 
 			if car.TurnSignal == simpkg.TurnSignalLeft {
 				// left = -right
-				ix := cx + hx*halfLen + (-rx)*halfWid
-				iz := cz + hz*halfLen + (-rz)*halfWid
+				ix := frontPos.X - hx*0.2 + (-rx)*halfWid
+				iz := frontPos.Y - hz*0.2 + (-rz)*halfWid
 				a.drawOrientedBox(rl.NewVector3(ix, indY, iz), indSize, angle, pitchDeg, rollDeg, amber)
 			} else {
-				ix := cx + hx*halfLen + rx*halfWid
-				iz := cz + hz*halfLen + rz*halfWid
+				ix := frontPos.X - hx*0.2 + rx*halfWid
+				iz := frontPos.Y - hz*0.2 + rz*halfWid
 				a.drawOrientedBox(rl.NewVector3(ix, indY, iz), indSize, angle, pitchDeg, rollDeg, amber)
 			}
 		}
 	}
+}
+
+func carBodyPose(car simpkg.Car, splines []simpkg.Spline) (frontPos, center, heading simpkg.Vec2, ok bool) {
+	spline, ok := simpkg.FindSplineByID(splines, car.CurrentSplineID)
+	if !ok {
+		return simpkg.Vec2{}, simpkg.Vec2{}, simpkg.Vec2{}, false
+	}
+	splinePos, splineTangent := simpkg.SampleSplineAtDistance(spline, car.DistanceOnSpline)
+	rightNormal := simpkg.Vec2{X: splineTangent.Y, Y: -splineTangent.X}
+	frontPos = vec2Add(splinePos, vec2Scale(rightNormal, car.LateralOffset))
+	heading = vec2Normalize(vec2Sub(frontPos, car.RearPosition))
+	if vec2LengthSq(vec2Sub(frontPos, car.RearPosition)) <= 1e-9 {
+		heading = splineTangent
+	}
+	center = vec2Scale(vec2Add(frontPos, car.RearPosition), 0.5)
+	return frontPos, center, heading, true
+}
+
+func vec2Add(a, b simpkg.Vec2) simpkg.Vec2 {
+	return simpkg.Vec2{X: a.X + b.X, Y: a.Y + b.Y}
+}
+
+func vec2Sub(a, b simpkg.Vec2) simpkg.Vec2 {
+	return simpkg.Vec2{X: a.X - b.X, Y: a.Y - b.Y}
+}
+
+func vec2Scale(v simpkg.Vec2, s float32) simpkg.Vec2 {
+	return simpkg.Vec2{X: v.X * s, Y: v.Y * s}
+}
+
+func vec2LengthSq(v simpkg.Vec2) float32 {
+	return v.X*v.X + v.Y*v.Y
+}
+
+func vec2Normalize(v simpkg.Vec2) simpkg.Vec2 {
+	lenSq := vec2LengthSq(v)
+	if lenSq <= 1e-9 {
+		return simpkg.Vec2{}
+	}
+	inv := 1 / float32(math.Sqrt(float64(lenSq)))
+	return vec2Scale(v, inv)
 }
 
 func (a *App) drawPedestrians() {
