@@ -73,10 +73,12 @@ type buildingRegionUpload struct {
 }
 
 type treeFoliageResources struct {
-	Texture  rl.Texture2D
-	Mesh     rl.Mesh
-	Material rl.Material
-	Loaded   bool
+	Texture     rl.Texture2D
+	Mesh        rl.Mesh
+	Material    rl.Material
+	Shader      rl.Shader
+	ShaderValid bool
+	Loaded      bool
 }
 
 type treeInstance struct {
@@ -178,8 +180,9 @@ func unloadSceneObjects(objects *sceneObjects) {
 	}
 	if objects.TreeFoliage.Loaded {
 		rl.UnloadMesh(&objects.TreeFoliage.Mesh)
+		// UnloadMaterial unloads both the attached shader and the albedo texture,
+		// so do not unload Texture/Shader explicitly here — that's a double-free.
 		rl.UnloadMaterial(objects.TreeFoliage.Material)
-		rl.UnloadTexture(objects.TreeFoliage.Texture)
 	}
 }
 
@@ -258,11 +261,9 @@ func drawTreeFoliage(foliage treeFoliageResources, visibleTrees []visibleTreeDra
 		return
 	}
 
-	rl.BeginBlendMode(rl.BlendAlpha)
 	rl.DisableBackfaceCulling()
 	rl.DrawMesh(foliage.Mesh, foliage.Material, rl.MatrixIdentity())
 	rl.EnableBackfaceCulling()
-	rl.EndBlendMode()
 }
 
 const foliageSpriteSize = 128
@@ -277,9 +278,8 @@ func buildFoliageAtlas() *image.NRGBA {
 }
 
 func uploadTreeFoliage(atlas *image.NRGBA, trees []treeInstance) treeFoliageResources {
-	imageData := rl.NewImageFromImage(atlas)
+	imageData := goImageToRaylibImage(atlas)
 	texture := rl.LoadTextureFromImage(imageData)
-	rl.UnloadImage(imageData)
 	if texture.ID == 0 {
 		return treeFoliageResources{}
 	}
@@ -295,13 +295,101 @@ func uploadTreeFoliage(atlas *image.NRGBA, trees []treeInstance) treeFoliageReso
 	material := rl.LoadMaterialDefault()
 	rl.SetMaterialTexture(&material, rl.MapAlbedo, texture)
 
+	shader := rl.LoadShaderFromMemory("", foliageFragmentShader)
+	shaderValid := shader.ID != 0
+	if shaderValid {
+		material.Shader = shader
+	}
+
 	return treeFoliageResources{
-		Texture:  texture,
-		Mesh:     mesh,
-		Material: material,
-		Loaded:   true,
+		Texture:     texture,
+		Mesh:        mesh,
+		Material:    material,
+		Shader:      shader,
+		ShaderValid: shaderValid,
+		Loaded:      true,
 	}
 }
+
+// goImageToRaylibImage builds an rl.Image backed by a contiguous RGBA8 buffer.
+// raylib-go's NewImageFromImage performs one CGO call per pixel, which made
+// uploading building textures dominate map load time.
+func goImageToRaylibImage(img image.Image) *rl.Image {
+	bounds := img.Bounds()
+	w := bounds.Dx()
+	h := bounds.Dy()
+	buf := make([]byte, w*h*4)
+
+	switch src := img.(type) {
+	case *image.NRGBA:
+		if src.Stride == w*4 && bounds.Min.X == 0 && bounds.Min.Y == 0 {
+			copy(buf, src.Pix)
+		} else {
+			for y := 0; y < h; y++ {
+				srcRow := src.Pix[(y+bounds.Min.Y-src.Rect.Min.Y)*src.Stride+(bounds.Min.X-src.Rect.Min.X)*4:]
+				copy(buf[y*w*4:(y+1)*w*4], srcRow[:w*4])
+			}
+		}
+	case *image.RGBA:
+		// image.RGBA is premultiplied; un-premultiply so the GPU sees straight RGBA.
+		for y := 0; y < h; y++ {
+			srcRow := src.Pix[(y+bounds.Min.Y-src.Rect.Min.Y)*src.Stride+(bounds.Min.X-src.Rect.Min.X)*4:]
+			dstRow := buf[y*w*4 : (y+1)*w*4]
+			for x := 0; x < w; x++ {
+				r := srcRow[x*4]
+				g := srcRow[x*4+1]
+				b := srcRow[x*4+2]
+				a := srcRow[x*4+3]
+				if a != 0 && a != 255 {
+					r = uint8(uint32(r) * 255 / uint32(a))
+					g = uint8(uint32(g) * 255 / uint32(a))
+					b = uint8(uint32(b) * 255 / uint32(a))
+				}
+				dstRow[x*4] = r
+				dstRow[x*4+1] = g
+				dstRow[x*4+2] = b
+				dstRow[x*4+3] = a
+			}
+		}
+	default:
+		i := 0
+		for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+			for x := bounds.Min.X; x < bounds.Max.X; x++ {
+				r, g, b, a := img.At(x, y).RGBA()
+				if a != 0 && a != 0xffff {
+					r = r * 0xffff / a
+					g = g * 0xffff / a
+					b = b * 0xffff / a
+				}
+				buf[i] = uint8(r >> 8)
+				buf[i+1] = uint8(g >> 8)
+				buf[i+2] = uint8(b >> 8)
+				buf[i+3] = uint8(a >> 8)
+				i += 4
+			}
+		}
+	}
+
+	return rl.NewImage(buf, int32(w), int32(h), 1, rl.UncompressedR8g8b8a8)
+}
+
+// foliageFragmentShader discards near-transparent fragments so foliage quads
+// write depth only where actual leaf pixels are drawn. Without this, the
+// transparent region of a closer tree's quad writes depth across its full
+// rectangle and occludes trees behind it, leaving a visible leaf-box hole.
+const foliageFragmentShader = `#version 330
+in vec2 fragTexCoord;
+in vec4 fragColor;
+uniform sampler2D texture0;
+uniform vec4 colDiffuse;
+out vec4 finalColor;
+void main() {
+    vec4 texelColor = texture(texture0, fragTexCoord);
+    vec4 col = texelColor * colDiffuse * fragColor;
+    if (col.a < 0.45) discard;
+    finalColor = vec4(col.rgb, 1.0);
+}
+`
 
 type foliageBlob struct {
 	X  float64
@@ -962,9 +1050,8 @@ func advanceBuildingRegionUpload(upload *buildingRegionUpload) (bool, error) {
 		rlMaterial := rl.LoadMaterialDefault()
 		rlMaterial.GetMap(int32(rl.MapAlbedo)).Color = material.Color
 		if material.TextureImage != nil {
-			imageData := rl.NewImageFromImage(material.TextureImage)
+			imageData := goImageToRaylibImage(material.TextureImage)
 			texture := rl.LoadTextureFromImage(imageData)
-			rl.UnloadImage(imageData)
 			if texture.ID != 0 {
 				rl.GenTextureMipmaps(&texture)
 				rl.SetTextureFilter(texture, rl.FilterTrilinear)
@@ -1060,12 +1147,9 @@ func unloadStreamedBuildingModel(model streamedBuildingModel) {
 	}
 	for _, material := range model.Materials {
 		if material.Maps != nil {
+			// UnloadMaterial also unloads the textures attached via SetMaterialTexture,
+			// so the model.Textures list must not be unloaded again separately.
 			rl.UnloadMaterial(material)
-		}
-	}
-	for _, texture := range model.Textures {
-		if texture.ID != 0 {
-			rl.UnloadTexture(texture)
 		}
 	}
 }

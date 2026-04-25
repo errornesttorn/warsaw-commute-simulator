@@ -33,10 +33,8 @@ type cropRect struct {
 }
 
 type terrainData struct {
-	heightImage   *rl.Image
-	textureImage  *rl.Image
-	model         rl.Model
-	texture       rl.Texture2D
+	tiles         []*terrainTile
+	streaming     *terrainStreaming
 	sourceTiles   []terrainTileSource
 	heightSamples []float64
 	position      rl.Vector3
@@ -135,32 +133,10 @@ func prepareTerrainCPU(mapDef *mapDefinition, meshMaxDim, textureMaxDim int) (*t
 }
 
 func finishTerrainGPU(cpu *terrainCPUData) (*terrainData, error) {
-	heightImage := rl.NewImageFromImage(cpu.heightGray)
-	textureImage := rl.NewImageFromImage(cpu.textureRGBA)
-
-	mesh := rl.GenMeshHeightmap(*heightImage, rl.NewVector3(cpu.widthMeters, cpu.heightMeters, cpu.depthMeters))
-	model := rl.LoadModelFromMesh(mesh)
-	texture := rl.LoadTextureFromImage(textureImage)
-	rl.GenTextureMipmaps(&texture)
-	rl.SetTextureFilter(texture, rl.FilterAnisotropic16x)
-	rl.SetTextureWrap(texture, rl.WrapClamp)
-
-	materials := model.GetMaterials()
-	if len(materials) == 0 {
-		rl.UnloadTexture(texture)
-		rl.UnloadImage(textureImage)
-		rl.UnloadImage(heightImage)
-		rl.UnloadModel(model)
-		return nil, errors.New("generated model has no material slots")
-	}
-	rl.SetMaterialTexture(&materials[0], rl.MapAlbedo, texture)
+	heightImage := rl.NewImage(cpu.heightGray.Pix, int32(cpu.cropW), int32(cpu.cropH), 1, rl.UncompressedGrayscale)
 
 	source := cpu.source
-	return &terrainData{
-		heightImage:   heightImage,
-		textureImage:  textureImage,
-		model:         model,
-		texture:       texture,
+	t := &terrainData{
 		sourceTiles:   source.tiles,
 		heightSamples: source.heights,
 		position: rl.NewVector3(
@@ -184,21 +160,20 @@ func finishTerrainGPU(cpu *terrainCPUData) (*terrainData, error) {
 		worldEast:     source.worldEast,
 		worldSouth:    source.worldSouth,
 		worldNorth:    source.worldNorth,
-	}, nil
+	}
+
+	t.tiles = buildTerrainTiles(t, heightImage, cpu.textureRGBA, source, terrainTileGridN)
+	if len(t.tiles) == 0 {
+		return nil, errors.New("failed to build terrain tiles")
+	}
+	return t, nil
 }
 
 func unloadTerrain(t *terrainData) {
 	if t == nil {
 		return
 	}
-	rl.UnloadModel(t.model)
-	rl.UnloadTexture(t.texture)
-	if t.heightImage != nil {
-		rl.UnloadImage(t.heightImage)
-	}
-	if t.textureImage != nil {
-		rl.UnloadImage(t.textureImage)
-	}
+	unloadTerrainTiles(t)
 }
 
 // terrainHeightAtLocal returns the terrain elevation (raylib Y) at a point

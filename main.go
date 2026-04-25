@@ -19,7 +19,7 @@ import (
 const (
 	screenW    = 1280
 	screenH    = 720
-	moveSpeed  = 20.0
+	moveSpeed  = 40.0
 	sprintMult = 6.0
 	mouseSens  = 0.2
 	groundY    = 0.0
@@ -32,7 +32,7 @@ const (
 	pedWidth      = 0.5
 
 	terrainMeshMaxDim    = 512
-	terrainTextureMaxDim = 4096
+	terrainTextureMaxDim = 8192
 )
 
 type App struct {
@@ -49,6 +49,7 @@ type App struct {
 	mouseCaptured bool
 	unitCube      rl.Model
 	loader        *mapLoader
+	showVRAM      bool
 }
 
 type loaderPhase int
@@ -65,8 +66,8 @@ type mapLoader struct {
 	statusMu sync.Mutex
 	status   string
 
-	cpuDone  atomic.Bool
-	cpuErr   atomic.Pointer[error]
+	cpuDone atomic.Bool
+	cpuErr  atomic.Pointer[error]
 	mapDef  *mapDefinition
 	terrain *terrainCPUData
 	scene   *sceneCPUData
@@ -178,6 +179,10 @@ func (a *App) update() {
 		a.showPaths = !a.showPaths
 	}
 
+	if rl.IsKeyPressed(rl.KeyF3) {
+		a.showVRAM = !a.showVRAM
+	}
+
 	if a.loaded && !a.paused {
 		a.world.Step(dt)
 	}
@@ -223,6 +228,8 @@ func (a *App) update() {
 	if rl.IsKeyDown(rl.KeyQ) {
 		a.camPos.Y -= speed * dt
 	}
+
+	pumpTerrainStreaming(a.terrain, a.camPos.X, a.camPos.Z)
 }
 
 // ---------- draw ----------
@@ -240,7 +247,7 @@ func (a *App) draw() {
 	camera := a.buildCamera()
 	rl.BeginMode3D(camera)
 	if a.terrain != nil {
-		rl.DrawModel(a.terrain.model, a.terrain.position, 1, rl.White)
+		drawTerrainTiles(a.terrain)
 		drawSceneObjects(camera, a.objects)
 	} else {
 		rl.DrawGrid(200, 1.0)
@@ -547,7 +554,7 @@ func (a *App) drawHUD() {
 	rl.DrawLine(cx-10, cy, cx+10, cy, rl.White)
 	rl.DrawLine(cx, cy-10, cx, cy+10, rl.White)
 
-	helpText := "TAB: toggle mouse | Ctrl+O: open | WASD+E/Q: fly | Space: pause | P: paths | Shift: sprint"
+	helpText := "TAB: toggle mouse | Ctrl+O: open | WASD+E/Q: fly | Space: pause | P: paths | F3: vram | Shift: sprint"
 	rl.DrawText(helpText, 8, h-24, 14, rl.LightGray)
 
 	if a.paused {
@@ -574,6 +581,10 @@ func (a *App) drawHUD() {
 	if !a.mouseCaptured {
 		msg := "MOUSE RELEASED - press TAB to recapture"
 		rl.DrawText(msg, w/2-int32(rl.MeasureText(msg, 16))/2, 8, 16, rl.Orange)
+	}
+
+	if a.showVRAM {
+		drawVRAMProfiler(a)
 	}
 }
 
@@ -853,6 +864,8 @@ func (a *App) installLoadedMap() {
 	a.yaw = 0
 
 	a.loader = nil
+
+	startTerrainStreaming(a.terrain)
 }
 
 func (a *App) sim2world(v simpkg.Vec2) rl.Vector3 {
