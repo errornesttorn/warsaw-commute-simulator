@@ -11,6 +11,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -23,6 +24,8 @@ type mapManifest struct {
 	Simulation   string             `json:"simulation,omitempty"`
 	RaylibCenter *mapManifestCenter `json:"raylib_center,omitempty"`
 	Tiles        []mapManifestTile  `json:"tiles"`
+	BuildingGLBs []string           `json:"building_glbs,omitempty"`
+	TreeFiles    []string           `json:"tree_files,omitempty"`
 }
 
 type mapManifestTile struct {
@@ -41,6 +44,8 @@ type mapDefinition struct {
 	Name             string
 	Simulation       string
 	Tiles            []terrainTileSource
+	BuildingGLBPaths []string
+	TreePaths        []string
 	RaylibCenterX    float64
 	RaylibCenterY    float64
 	RaylibCenterZ    float64
@@ -136,6 +141,16 @@ func loadMapDefinition(mapPath string) (*mapDefinition, error) {
 		Simulation:   manifest.Simulation,
 		Tiles:        tiles,
 	}
+	buildingGLBPaths, err := resolveMapFilePatterns(baseDir, manifest.BuildingGLBs)
+	if err != nil {
+		return nil, fmt.Errorf("resolve building GLB files: %w", err)
+	}
+	mapDef.BuildingGLBPaths = buildingGLBPaths
+	treePaths, err := resolveMapFilePatterns(baseDir, manifest.TreeFiles)
+	if err != nil {
+		return nil, fmt.Errorf("resolve tree files: %w", err)
+	}
+	mapDef.TreePaths = treePaths
 	if manifest.RaylibCenter != nil {
 		mapDef.RaylibCenterX = manifest.RaylibCenter.X
 		mapDef.RaylibCenterY = manifest.RaylibCenter.Y
@@ -144,6 +159,53 @@ func loadMapDefinition(mapPath string) (*mapDefinition, error) {
 	}
 
 	return mapDef, nil
+}
+
+func resolveMapFilePatterns(baseDir string, entries []string) ([]string, error) {
+	var paths []string
+	seen := map[string]bool{}
+
+	for _, entry := range entries {
+		if strings.TrimSpace(entry) == "" {
+			continue
+		}
+
+		pattern := entry
+		if !filepath.IsAbs(pattern) {
+			pattern = filepath.Join(baseDir, pattern)
+		}
+		pattern = filepath.Clean(pattern)
+
+		var matches []string
+		if hasGlobMeta(pattern) {
+			var err error
+			matches, err = filepath.Glob(pattern)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", entry, err)
+			}
+			if len(matches) == 0 {
+				return nil, fmt.Errorf("%s: no matches", entry)
+			}
+		} else {
+			matches = []string{pattern}
+		}
+
+		sort.Strings(matches)
+		for _, match := range matches {
+			match = filepath.Clean(match)
+			if seen[match] {
+				continue
+			}
+			seen[match] = true
+			paths = append(paths, match)
+		}
+	}
+
+	return paths, nil
+}
+
+func hasGlobMeta(path string) bool {
+	return strings.ContainsAny(path, "*?[")
 }
 
 func prepareTerrainSource(mapDef *mapDefinition, meshMaxDim int) (*preparedTerrainSource, error) {

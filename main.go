@@ -35,7 +35,10 @@ const (
 type App struct {
 	world         *simpkg.World
 	loaded        bool
+	paused        bool
+	showPaths     bool
 	terrain       *terrainData
+	objects       *sceneObjects
 	mapName       string
 	camPos        rl.Vector3
 	yaw           float32
@@ -55,10 +58,12 @@ func main() {
 		camPos:        rl.NewVector3(0, 10, 0),
 		pitch:         -20,
 		mouseCaptured: true,
+		showPaths:     true,
 		unitCube:      rl.LoadModelFromMesh(rl.GenMeshCube(1, 1, 1)),
 	}
 	defer rl.UnloadModel(app.unitCube)
 	defer func() { unloadTerrain(app.terrain) }()
+	defer func() { unloadSceneObjects(app.objects) }()
 
 	for !rl.WindowShouldClose() {
 		app.update()
@@ -71,7 +76,7 @@ func main() {
 func (a *App) update() {
 	dt := rl.GetFrameTime()
 
-	if rl.IsKeyPressed(rl.KeyEscape) {
+	if rl.IsKeyPressed(rl.KeyTab) {
 		a.mouseCaptured = !a.mouseCaptured
 		if a.mouseCaptured {
 			rl.DisableCursor()
@@ -80,11 +85,23 @@ func (a *App) update() {
 		}
 	}
 
+	if rl.IsKeyPressed(rl.KeyEscape) {
+		rl.CloseWindow()
+	}
+
 	if (rl.IsKeyDown(rl.KeyLeftControl) || rl.IsKeyDown(rl.KeyRightControl)) && rl.IsKeyPressed(rl.KeyO) {
 		a.openMap()
 	}
 
-	if a.loaded {
+	if rl.IsKeyPressed(rl.KeySpace) {
+		a.paused = !a.paused
+	}
+
+	if rl.IsKeyPressed(rl.KeyP) {
+		a.showPaths = !a.showPaths
+	}
+
+	if a.loaded && !a.paused {
 		a.world.Step(dt)
 	}
 
@@ -123,10 +140,10 @@ func (a *App) update() {
 	if rl.IsKeyDown(rl.KeyD) {
 		a.camPos = addVec3(a.camPos, scaleVec3(right, -speed*dt))
 	}
-	if rl.IsKeyDown(rl.KeySpace) {
+	if rl.IsKeyDown(rl.KeyE) {
 		a.camPos.Y += speed * dt
 	}
-	if rl.IsKeyDown(rl.KeyLeftControl) && !rl.IsKeyDown(rl.KeyO) {
+	if rl.IsKeyDown(rl.KeyQ) {
 		a.camPos.Y -= speed * dt
 	}
 }
@@ -137,16 +154,20 @@ func (a *App) draw() {
 	rl.BeginDrawing()
 	rl.ClearBackground(rl.NewColor(30, 30, 40, 255))
 
-	rl.BeginMode3D(a.buildCamera())
+	camera := a.buildCamera()
+	rl.BeginMode3D(camera)
 	if a.terrain != nil {
 		rl.DrawModel(a.terrain.model, a.terrain.position, 1, rl.White)
+		drawSceneObjects(camera, a.objects)
 	} else {
 		rl.DrawGrid(200, 1.0)
 	}
 
 	if a.loaded {
-		a.drawPedestrianPaths()
-		a.drawSplines()
+		if a.showPaths {
+			a.drawPedestrianPaths()
+			a.drawSplines()
+		}
 		a.drawTrafficLights()
 		a.drawCars()
 		a.drawPedestrians()
@@ -401,17 +422,36 @@ func (a *App) drawHUD() {
 	rl.DrawLine(cx-10, cy, cx+10, cy, rl.White)
 	rl.DrawLine(cx, cy-10, cx, cy+10, rl.White)
 
-	rl.DrawText("ESC: toggle mouse | Ctrl+O: open | WASD+Space/Ctrl: fly | Shift: sprint", 8, h-24, 14, rl.LightGray)
+	helpText := "TAB: toggle mouse | Ctrl+O: open | WASD+E/Q: fly | Space: pause | P: paths | Shift: sprint"
+	rl.DrawText(helpText, 8, h-24, 14, rl.LightGray)
+
+	if a.paused {
+		msg := "PAUSED"
+		tw := rl.MeasureText(msg, 30)
+		rl.DrawText(msg, w/2-tw/2, h/2-60, 30, rl.Red)
+	}
 
 	if a.loaded {
-		info := fmt.Sprintf("Cars: %d  Splines: %d  Peds: %d  Pos: (%.1f, %.1f, %.1f)",
+		buildings := 0
+		loadedBuildings := 0
+		loadedRegions := 0
+		totalRegions := 0
+		trees := 0
+		if a.objects != nil {
+			buildings = a.objects.BuildingCount
+			loadedBuildings = a.objects.LoadedBuildingCount
+			loadedRegions = a.objects.LoadedBuildingRegionCount
+			totalRegions = len(a.objects.BuildingRegions)
+			trees = len(a.objects.Trees)
+		}
+		info := fmt.Sprintf("Cars: %d  Splines: %d  Peds: %d  Buildings: %d/%d  GLB: %d/%d  Trees: %d  Pos: (%.1f, %.1f, %.1f)",
 			len(a.world.Cars), len(a.world.Splines), len(a.world.Pedestrians),
-			a.camPos.X, a.camPos.Y, a.camPos.Z)
+			loadedBuildings, buildings, loadedRegions, totalRegions, trees, a.camPos.X, a.camPos.Y, a.camPos.Z)
 		rl.DrawText(info, 8, 8, 16, rl.White)
 	}
 
 	if !a.mouseCaptured {
-		msg := "MOUSE RELEASED - press ESC to recapture"
+		msg := "MOUSE RELEASED - press TAB to recapture"
 		rl.DrawText(msg, w/2-int32(rl.MeasureText(msg, 16))/2, 8, 16, rl.Orange)
 	}
 }
@@ -536,8 +576,15 @@ func (a *App) openMap() {
 		return
 	}
 
+	objects, objectsErr := loadSceneObjects(mapDef, terrain)
+	if objectsErr != nil {
+		fmt.Printf("Map loaded, but scene object load had problems: %v\n", objectsErr)
+	}
+
 	unloadTerrain(a.terrain)
+	unloadSceneObjects(a.objects)
 	a.terrain = terrain
+	a.objects = objects
 	a.mapName = mapDef.Name
 	a.world = nil
 	a.loaded = false
