@@ -2,20 +2,21 @@ package main
 
 import (
 	"bufio"
+	"crypto/sha1"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"image"
 	"image/draw"
 	"image/png"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
-
-	rl "github.com/gen2brain/raylib-go/raylib"
 )
 
 type mapManifest struct {
@@ -229,6 +230,14 @@ func prepareTerrainSource(mapDef *mapDefinition, meshMaxDim int) (*preparedTerra
 	}
 
 	targetW, targetH := fitDimensionsBySpan(unionEast-unionWest, unionNorth-unionSouth, meshMaxDim)
+
+	cachePath, cacheKeyErr := terrainGridCachePath(mapDef, meshMaxDim, targetW, targetH, unionWest, unionEast, unionSouth, unionNorth)
+	if cacheKeyErr == nil {
+		if cached, ok := loadTerrainGridCache(cachePath, targetW, targetH); ok {
+			return finishPreparedTerrainSource(mapDef, cached.sums, cached.counts, cached.valid, targetW, targetH, unionWest, unionEast, unionSouth, unionNorth)
+		}
+	}
+
 	sums := make([]float64, targetW*targetH)
 	counts := make([]int, targetW*targetH)
 	valid := make([]bool, targetW*targetH)
@@ -243,6 +252,14 @@ func prepareTerrainSource(mapDef *mapDefinition, meshMaxDim int) (*preparedTerra
 		}
 	}
 
+	if cacheKeyErr == nil {
+		_ = saveTerrainGridCache(cachePath, sums, counts, valid, targetW, targetH)
+	}
+
+	return finishPreparedTerrainSource(mapDef, sums, counts, valid, targetW, targetH, unionWest, unionEast, unionSouth, unionNorth)
+}
+
+func finishPreparedTerrainSource(mapDef *mapDefinition, sums []float64, counts []int, valid []bool, targetW, targetH int, unionWest, unionEast, unionSouth, unionNorth float64) (*preparedTerrainSource, error) {
 	crop, ok := findValidCrop(valid, targetW, targetH)
 	if !ok {
 		return nil, errors.New("map contains no valid height samples")
@@ -459,7 +476,7 @@ func accumulateDEMIntoGrid(path string, meta demMetadata, worldWest, worldEast, 
 	return scanner.Err()
 }
 
-func loadOrthophotoMosaicImage(tiles []terrainTileSource, worldWest, worldEast, worldSouth, worldNorth float64, textureMaxDim int) (*rl.Image, int, int, error) {
+func buildOrthoMosaic(tiles []terrainTileSource, worldWest, worldEast, worldSouth, worldNorth float64, textureMaxDim int) (*image.RGBA, int, int, error) {
 	textureW, textureH := fitDimensionsBySpan(worldEast-worldWest, worldNorth-worldSouth, textureMaxDim)
 	canvas := image.NewRGBA(image.Rect(0, 0, textureW, textureH))
 
@@ -484,7 +501,7 @@ func loadOrthophotoMosaicImage(tiles []terrainTileSource, worldWest, worldEast, 
 		draw.Draw(canvas, dst, img, image.Point{}, draw.Src)
 	}
 
-	return rl.NewImageFromImage(canvas), textureW, textureH, nil
+	return canvas, textureW, textureH, nil
 }
 
 func loadOrthophotoImageExact(orthoPath string, worldWest, worldEast, worldSouth, worldNorth float64, width, height int) (image.Image, error) {
@@ -527,6 +544,132 @@ func worldBoundsToImageRect(tileWest, tileEast, tileSouth, tileNorth, worldWest,
 	}
 
 	return image.Rect(x0, y0, x1, y1)
+}
+
+type terrainGridCacheData struct {
+	sums   []float64
+	counts []int
+	valid  []bool
+}
+
+const terrainGridCacheMagic uint32 = 0x44454d31 // "DEM1"
+
+func terrainGridCachePath(mapDef *mapDefinition, meshMaxDim, targetW, targetH int, west, east, south, north float64) (string, error) {
+	if mapDef == nil || len(mapDef.Tiles) == 0 {
+		return "", errors.New("no map")
+	}
+	baseDir := filepath.Dir(mapDef.ManifestPath)
+	cacheDir := filepath.Join(baseDir, ".terrain-cache")
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		return "", err
+	}
+
+	h := sha1.New()
+	fmt.Fprintf(h, "v1|%d|%d|%d|%.6f|%.6f|%.6f|%.6f", meshMaxDim, targetW, targetH, west, east, south, north)
+	for _, tile := range mapDef.Tiles {
+		info, err := os.Stat(tile.DEMPath)
+		if err != nil {
+			return "", err
+		}
+		fmt.Fprintf(h, "|%s|%d|%d", filepath.Base(tile.DEMPath), info.Size(), info.ModTime().UnixNano())
+	}
+	return filepath.Join(cacheDir, fmt.Sprintf("dem-grid-%x.bin", h.Sum(nil))), nil
+}
+
+func loadTerrainGridCache(path string, targetW, targetH int) (terrainGridCacheData, bool) {
+	file, err := os.Open(path)
+	if err != nil {
+		return terrainGridCacheData{}, false
+	}
+	defer file.Close()
+
+	var header struct {
+		Magic   uint32
+		Version uint32
+		Width   uint32
+		Height  uint32
+	}
+	if err := binary.Read(file, binary.LittleEndian, &header); err != nil {
+		return terrainGridCacheData{}, false
+	}
+	if header.Magic != terrainGridCacheMagic || header.Version != 1 ||
+		int(header.Width) != targetW || int(header.Height) != targetH {
+		return terrainGridCacheData{}, false
+	}
+
+	n := targetW * targetH
+	sums := make([]float64, n)
+	counts := make([]int, n)
+	valid := make([]bool, n)
+
+	if err := binary.Read(file, binary.LittleEndian, sums); err != nil {
+		return terrainGridCacheData{}, false
+	}
+	counts32 := make([]int32, n)
+	if err := binary.Read(file, binary.LittleEndian, counts32); err != nil {
+		return terrainGridCacheData{}, false
+	}
+	for i, v := range counts32 {
+		counts[i] = int(v)
+	}
+	validBytes := make([]byte, n)
+	if _, err := io.ReadFull(file, validBytes); err != nil {
+		return terrainGridCacheData{}, false
+	}
+	for i, v := range validBytes {
+		valid[i] = v != 0
+	}
+
+	return terrainGridCacheData{sums: sums, counts: counts, valid: valid}, true
+}
+
+func saveTerrainGridCache(path string, sums []float64, counts []int, valid []bool, targetW, targetH int) error {
+	tmp := path + ".tmp"
+	file, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		file.Close()
+		os.Remove(tmp)
+	}()
+
+	w := bufio.NewWriter(file)
+	header := struct {
+		Magic   uint32
+		Version uint32
+		Width   uint32
+		Height  uint32
+	}{terrainGridCacheMagic, 1, uint32(targetW), uint32(targetH)}
+	if err := binary.Write(w, binary.LittleEndian, header); err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.LittleEndian, sums); err != nil {
+		return err
+	}
+	counts32 := make([]int32, len(counts))
+	for i, v := range counts {
+		counts32[i] = int32(v)
+	}
+	if err := binary.Write(w, binary.LittleEndian, counts32); err != nil {
+		return err
+	}
+	validBytes := make([]byte, len(valid))
+	for i, v := range valid {
+		if v {
+			validBytes[i] = 1
+		}
+	}
+	if _, err := w.Write(validBytes); err != nil {
+		return err
+	}
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 func clampInt(v, lo, hi int) int {

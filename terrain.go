@@ -58,7 +58,20 @@ type terrainData struct {
 	worldNorth    float64
 }
 
-func loadTerrain(mapDef *mapDefinition, meshMaxDim int, textureMaxDim int) (*terrainData, error) {
+type terrainCPUData struct {
+	heightGray   *image.Gray
+	textureRGBA  *image.RGBA
+	source       *preparedTerrainSource
+	cropW        int
+	cropH        int
+	textureW     int
+	textureH     int
+	widthMeters  float32
+	depthMeters  float32
+	heightMeters float32
+}
+
+func prepareTerrainCPU(mapDef *mapDefinition, meshMaxDim, textureMaxDim int) (*terrainCPUData, error) {
 	source, err := prepareTerrainSource(mapDef, meshMaxDim)
 	if err != nil {
 		return nil, err
@@ -77,7 +90,6 @@ func loadTerrain(mapDef *mapDefinition, meshMaxDim int, textureMaxDim int) (*ter
 	if heightRange <= 0 {
 		heightRange = 1
 	}
-
 	for i, v := range source.heights {
 		normalized := (v - source.minHeight) / heightRange
 		if normalized < 0 {
@@ -89,9 +101,7 @@ func loadTerrain(mapDef *mapDefinition, meshMaxDim int, textureMaxDim int) (*ter
 		heightImg.Pix[i] = uint8(math.Round(normalized * 255))
 	}
 
-	heightImage := rl.NewImageFromImage(heightImg)
-
-	textureImage, textureW, textureH, err := loadOrthophotoMosaicImage(
+	textureRGBA, textureW, textureH, err := buildOrthoMosaic(
 		source.tiles,
 		source.worldWest,
 		source.worldEast,
@@ -100,7 +110,6 @@ func loadTerrain(mapDef *mapDefinition, meshMaxDim int, textureMaxDim int) (*ter
 		textureMaxDim,
 	)
 	if err != nil {
-		rl.UnloadImage(heightImage)
 		return nil, err
 	}
 
@@ -111,7 +120,25 @@ func loadTerrain(mapDef *mapDefinition, meshMaxDim int, textureMaxDim int) (*ter
 		meshHeightMeters = 1
 	}
 
-	mesh := rl.GenMeshHeightmap(*heightImage, rl.NewVector3(meshWidthMeters, meshHeightMeters, meshDepthMeters))
+	return &terrainCPUData{
+		heightGray:   heightImg,
+		textureRGBA:  textureRGBA,
+		source:       source,
+		cropW:        cropW,
+		cropH:        cropH,
+		textureW:     textureW,
+		textureH:     textureH,
+		widthMeters:  meshWidthMeters,
+		depthMeters:  meshDepthMeters,
+		heightMeters: meshHeightMeters,
+	}, nil
+}
+
+func finishTerrainGPU(cpu *terrainCPUData) (*terrainData, error) {
+	heightImage := rl.NewImageFromImage(cpu.heightGray)
+	textureImage := rl.NewImageFromImage(cpu.textureRGBA)
+
+	mesh := rl.GenMeshHeightmap(*heightImage, rl.NewVector3(cpu.widthMeters, cpu.heightMeters, cpu.depthMeters))
 	model := rl.LoadModelFromMesh(mesh)
 	texture := rl.LoadTextureFromImage(textureImage)
 	rl.GenTextureMipmaps(&texture)
@@ -128,6 +155,7 @@ func loadTerrain(mapDef *mapDefinition, meshMaxDim int, textureMaxDim int) (*ter
 	}
 	rl.SetMaterialTexture(&materials[0], rl.MapAlbedo, texture)
 
+	source := cpu.source
 	return &terrainData{
 		heightImage:   heightImage,
 		textureImage:  textureImage,
@@ -143,15 +171,15 @@ func loadTerrain(mapDef *mapDefinition, meshMaxDim int, textureMaxDim int) (*ter
 		centerWorldX:  source.centerX,
 		centerWorldY:  source.centerY,
 		centerWorldZ:  source.centerZ,
-		widthMeters:   meshWidthMeters,
-		depthMeters:   meshDepthMeters,
-		heightMeters:  meshHeightMeters,
+		widthMeters:   cpu.widthMeters,
+		depthMeters:   cpu.depthMeters,
+		heightMeters:  cpu.heightMeters,
 		heightMin:     source.minHeight,
 		heightMax:     source.maxHeight,
-		meshWidth:     cropW,
-		meshHeight:    cropH,
-		textureWidth:  textureW,
-		textureHeight: textureH,
+		meshWidth:     cpu.cropW,
+		meshHeight:    cpu.cropH,
+		textureWidth:  cpu.textureW,
+		textureHeight: cpu.textureH,
 		worldWest:     source.worldWest,
 		worldEast:     source.worldEast,
 		worldSouth:    source.worldSouth,

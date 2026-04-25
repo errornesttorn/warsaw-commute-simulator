@@ -3,11 +3,14 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	simpkg "github.com/errornesttorn/mini-traffic-simulation-core"
 	rl "github.com/gen2brain/raylib-go/raylib"
@@ -45,6 +48,75 @@ type App struct {
 	pitch         float32
 	mouseCaptured bool
 	unitCube      rl.Model
+	loader        *mapLoader
+}
+
+type loaderPhase int
+
+const (
+	loaderPhaseCPU loaderPhase = iota
+	loaderPhaseTerrain
+	loaderPhaseBuildings
+	loaderPhaseTrees
+	loaderPhaseDone
+)
+
+type mapLoader struct {
+	statusMu sync.Mutex
+	status   string
+
+	cpuDone  atomic.Bool
+	cpuErr   atomic.Pointer[error]
+	mapDef  *mapDefinition
+	terrain *terrainCPUData
+	scene   *sceneCPUData
+
+	phase         loaderPhase
+	terrainData   *terrainData
+	regions       []buildingRegion
+	buildingCount int
+	regionIdx     int
+	regionUpload  *buildingRegionUpload
+	foliage       treeFoliageResources
+	problems      []error
+}
+
+func (l *mapLoader) setStatus(s string) {
+	l.statusMu.Lock()
+	l.status = s
+	l.statusMu.Unlock()
+}
+
+func (l *mapLoader) getStatus() string {
+	l.statusMu.Lock()
+	defer l.statusMu.Unlock()
+	return l.status
+}
+
+func (l *mapLoader) progress() (float32, string) {
+	if l == nil {
+		return 0, ""
+	}
+	switch l.phase {
+	case loaderPhaseCPU:
+		return 0.05, l.getStatus()
+	case loaderPhaseTerrain:
+		return 0.30, "uploading terrain"
+	case loaderPhaseBuildings:
+		total := 0
+		if l.scene != nil {
+			total = len(l.scene.ParsedRegions)
+		}
+		frac := float32(0)
+		if total > 0 {
+			frac = float32(l.regionIdx) / float32(total)
+		}
+		return 0.35 + 0.55*frac, fmt.Sprintf("uploading buildings %d / %d", l.regionIdx, total)
+	case loaderPhaseTrees:
+		return 0.92, "uploading trees"
+	default:
+		return 1, "done"
+	}
 }
 
 func main() {
@@ -76,6 +148,15 @@ func main() {
 func (a *App) update() {
 	dt := rl.GetFrameTime()
 
+	if rl.IsKeyPressed(rl.KeyEscape) {
+		rl.CloseWindow()
+	}
+
+	if a.loader != nil {
+		a.advanceLoader()
+		return
+	}
+
 	if rl.IsKeyPressed(rl.KeyTab) {
 		a.mouseCaptured = !a.mouseCaptured
 		if a.mouseCaptured {
@@ -83,10 +164,6 @@ func (a *App) update() {
 		} else {
 			rl.EnableCursor()
 		}
-	}
-
-	if rl.IsKeyPressed(rl.KeyEscape) {
-		rl.CloseWindow()
 	}
 
 	if (rl.IsKeyDown(rl.KeyLeftControl) || rl.IsKeyDown(rl.KeyRightControl)) && rl.IsKeyPressed(rl.KeyO) {
@@ -154,6 +231,12 @@ func (a *App) draw() {
 	rl.BeginDrawing()
 	rl.ClearBackground(rl.NewColor(30, 30, 40, 255))
 
+	if a.loader != nil {
+		a.drawLoadingScreen()
+		rl.EndDrawing()
+		return
+	}
+
 	camera := a.buildCamera()
 	rl.BeginMode3D(camera)
 	if a.terrain != nil {
@@ -176,6 +259,48 @@ func (a *App) draw() {
 	rl.EndMode3D()
 	a.drawHUD()
 	rl.EndDrawing()
+}
+
+func (a *App) drawLoadingScreen() {
+	w := int32(rl.GetScreenWidth())
+	h := int32(rl.GetScreenHeight())
+
+	frac, status := a.loader.progress()
+	if frac < 0 {
+		frac = 0
+	}
+	if frac > 1 {
+		frac = 1
+	}
+
+	title := "Loading map…"
+	if a.loader.mapDef != nil {
+		title = fmt.Sprintf("Loading %s…", a.loader.mapDef.Name)
+	}
+	titleSize := int32(28)
+	tw := rl.MeasureText(title, titleSize)
+	rl.DrawText(title, w/2-tw/2, h/2-80, titleSize, rl.White)
+
+	barW := int32(420)
+	if barW > w-80 {
+		barW = w - 80
+	}
+	barH := int32(22)
+	barX := w/2 - barW/2
+	barY := h/2 - barH/2
+
+	rl.DrawRectangle(barX, barY, barW, barH, rl.NewColor(50, 50, 60, 255))
+	rl.DrawRectangle(barX, barY, int32(float32(barW)*frac), barH, rl.NewColor(120, 200, 120, 255))
+	rl.DrawRectangleLines(barX, barY, barW, barH, rl.LightGray)
+
+	pct := fmt.Sprintf("%d%%", int(frac*100))
+	pw := rl.MeasureText(pct, 18)
+	rl.DrawText(pct, w/2-pw/2, barY+barH+12, 18, rl.White)
+
+	if status != "" {
+		sw := rl.MeasureText(status, 16)
+		rl.DrawText(status, w/2-sw/2, barY+barH+38, 16, rl.LightGray)
+	}
 }
 
 func (a *App) buildCamera() rl.Camera3D {
@@ -433,20 +558,16 @@ func (a *App) drawHUD() {
 
 	if a.loaded {
 		buildings := 0
-		loadedBuildings := 0
-		loadedRegions := 0
 		totalRegions := 0
 		trees := 0
 		if a.objects != nil {
 			buildings = a.objects.BuildingCount
-			loadedBuildings = a.objects.LoadedBuildingCount
-			loadedRegions = a.objects.LoadedBuildingRegionCount
 			totalRegions = len(a.objects.BuildingRegions)
 			trees = len(a.objects.Trees)
 		}
-		info := fmt.Sprintf("Cars: %d  Splines: %d  Peds: %d  Buildings: %d/%d  GLB: %d/%d  Trees: %d  Pos: (%.1f, %.1f, %.1f)",
+		info := fmt.Sprintf("Cars: %d  Splines: %d  Peds: %d  Buildings: %d  GLB: %d  Trees: %d  Pos: (%.1f, %.1f, %.1f)",
 			len(a.world.Cars), len(a.world.Splines), len(a.world.Pedestrians),
-			loadedBuildings, buildings, loadedRegions, totalRegions, trees, a.camPos.X, a.camPos.Y, a.camPos.Z)
+			buildings, totalRegions, trees, a.camPos.X, a.camPos.Y, a.camPos.Z)
 		rl.DrawText(info, 8, 8, 16, rl.White)
 	}
 
@@ -556,6 +677,9 @@ func (a *App) trafficLightColor(light simpkg.TrafficLight) rl.Color {
 }
 
 func (a *App) openMap() {
+	if a.loader != nil {
+		return
+	}
 	rl.EnableCursor()
 	path, err := pickMapPath()
 	rl.DisableCursor()
@@ -570,42 +694,165 @@ func (a *App) openMap() {
 		return
 	}
 
-	terrain, err := loadTerrain(mapDef, terrainMeshMaxDim, terrainTextureMaxDim)
-	if err != nil {
-		fmt.Printf("Failed to build terrain: %v\n", err)
+	loader := &mapLoader{mapDef: mapDef, phase: loaderPhaseCPU}
+	loader.setStatus("preparing terrain")
+	a.loader = loader
+
+	go func() {
+		terrainCPU, err := prepareTerrainCPU(mapDef, terrainMeshMaxDim, terrainTextureMaxDim)
+		if err != nil {
+			e := fmt.Errorf("build terrain: %w", err)
+			loader.cpuErr.Store(&e)
+			loader.cpuDone.Store(true)
+			return
+		}
+		fakeTerrain := terrainForSceneCPU(terrainCPU)
+		scene := prepareSceneCPU(mapDef, fakeTerrain, loader.setStatus)
+		loader.terrain = terrainCPU
+		loader.scene = scene
+		loader.cpuDone.Store(true)
+	}()
+}
+
+func terrainForSceneCPU(cpu *terrainCPUData) *terrainData {
+	source := cpu.source
+	return &terrainData{
+		heightSamples: source.heights,
+		position: rl.NewVector3(
+			float32(source.worldWest-source.centerX),
+			float32(source.minHeight-source.centerZ),
+			float32(source.centerY-source.worldNorth),
+		),
+		centerWorldX: source.centerX,
+		centerWorldY: source.centerY,
+		centerWorldZ: source.centerZ,
+		widthMeters:  cpu.widthMeters,
+		depthMeters:  cpu.depthMeters,
+		heightMeters: cpu.heightMeters,
+		heightMin:    source.minHeight,
+		heightMax:    source.maxHeight,
+		meshWidth:    cpu.cropW,
+		meshHeight:   cpu.cropH,
+		textureWidth: cpu.textureW,
+		worldWest:    source.worldWest,
+		worldEast:    source.worldEast,
+		worldSouth:   source.worldSouth,
+		worldNorth:   source.worldNorth,
+	}
+}
+
+func (a *App) advanceLoader() {
+	l := a.loader
+	if l == nil {
 		return
 	}
 
-	objects, objectsErr := loadSceneObjects(mapDef, terrain)
-	if objectsErr != nil {
-		fmt.Printf("Map loaded, but scene object load had problems: %v\n", objectsErr)
+	switch l.phase {
+	case loaderPhaseCPU:
+		if !l.cpuDone.Load() {
+			return
+		}
+		if errPtr := l.cpuErr.Load(); errPtr != nil {
+			fmt.Printf("Failed to load map: %v\n", *errPtr)
+			a.loader = nil
+			return
+		}
+		l.phase = loaderPhaseTerrain
+
+	case loaderPhaseTerrain:
+		td, err := finishTerrainGPU(l.terrain)
+		if err != nil {
+			fmt.Printf("Failed to upload terrain: %v\n", err)
+			a.loader = nil
+			return
+		}
+		l.terrainData = td
+		l.phase = loaderPhaseBuildings
+
+	case loaderPhaseBuildings:
+		if l.regionIdx >= len(l.scene.ParsedRegions) {
+			l.phase = loaderPhaseTrees
+			return
+		}
+		region := &l.scene.ParsedRegions[l.regionIdx]
+		if l.regionUpload == nil {
+			l.regionUpload = newBuildingRegionUpload(region.Data)
+		}
+		// Advance several upload steps per frame to keep loading snappy.
+		for step := 0; step < 8; step++ {
+			done, err := advanceBuildingRegionUpload(l.regionUpload)
+			if err != nil {
+				l.problems = append(l.problems, fmt.Errorf("%s: %w", filepath.Base(region.Path), err))
+				l.regionUpload = nil
+				l.regionIdx++
+				return
+			}
+			if done {
+				l.regions = append(l.regions, buildingRegion{
+					Path:          region.Path,
+					Position:      region.Position,
+					Model:         l.regionUpload.Model,
+					BuildingCount: region.BuildingCount,
+				})
+				l.buildingCount += region.BuildingCount
+				l.regionUpload = nil
+				l.regionIdx++
+				return
+			}
+		}
+
+	case loaderPhaseTrees:
+		if len(l.scene.Trees) > 0 && l.scene.FoliageAtlas != nil {
+			l.foliage = uploadTreeFoliage(l.scene.FoliageAtlas, l.scene.Trees)
+		}
+		l.phase = loaderPhaseDone
+		a.installLoadedMap()
+	}
+}
+
+func (a *App) installLoadedMap() {
+	l := a.loader
+	if l == nil {
+		return
+	}
+
+	objects := &sceneObjects{
+		BuildingRegions: l.regions,
+		BuildingCount:   l.buildingCount,
+		Trees:           l.scene.Trees,
+		TreeFoliage:     l.foliage,
 	}
 
 	unloadTerrain(a.terrain)
 	unloadSceneObjects(a.objects)
-	a.terrain = terrain
+	a.terrain = l.terrainData
 	a.objects = objects
-	a.mapName = mapDef.Name
+	a.mapName = l.mapDef.Name
 	a.world = nil
 	a.loaded = false
 
-	if mapDef.Simulation != "" {
-		simPath := filepath.Join(filepath.Dir(mapDef.ManifestPath), mapDef.Simulation)
+	if len(l.problems) > 0 {
+		fmt.Printf("Map loaded, but scene object load had problems: %v\n", errors.Join(l.problems...))
+	}
+
+	if l.mapDef.Simulation != "" {
+		simPath := filepath.Join(filepath.Dir(l.mapDef.ManifestPath), l.mapDef.Simulation)
 		if w, err := simpkg.LoadWorld(simPath); err == nil {
 			a.world = w
 			a.loaded = true
 		} else {
-			fmt.Printf("Map loaded, but simulation %s failed: %v\n", mapDef.Simulation, err)
+			fmt.Printf("Map loaded, but simulation %s failed: %v\n", l.mapDef.Simulation, err)
 		}
 	}
 
-	// Camera: centre over the terrain at a reasonable height.
-	cx := terrain.position.X + terrain.widthMeters*0.5
-	cz := terrain.position.Z + terrain.depthMeters*0.5
-	ground := terrainHeightAtLocal(terrain, cx, cz)
-	a.camPos = rl.NewVector3(cx, ground+80, cz+terrain.depthMeters*0.4)
+	cx := a.terrain.position.X + a.terrain.widthMeters*0.5
+	cz := a.terrain.position.Z + a.terrain.depthMeters*0.5
+	ground := terrainHeightAtLocal(a.terrain, cx, cz)
+	a.camPos = rl.NewVector3(cx, ground+80, cz+a.terrain.depthMeters*0.4)
 	a.pitch = -35
 	a.yaw = 0
+
+	a.loader = nil
 }
 
 func (a *App) sim2world(v simpkg.Vec2) rl.Vector3 {

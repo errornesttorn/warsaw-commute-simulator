@@ -9,62 +9,35 @@ import (
 	"fmt"
 	"image"
 	"image/color"
-	"io"
 	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
-	"sort"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 
 	rl "github.com/gen2brain/raylib-go/raylib"
 )
 
 type sceneObjects struct {
-	BuildingRegions           []buildingRegion
-	BuildingCount             int
-	LoadedBuildingCount       int
-	LoadedBuildingRegionCount int
-	buildingLoadJobs          chan buildingRegionLoadJob
-	buildingLoadResults       chan buildingRegionLoadResult
-	buildingLoadDone          chan struct{}
-	TreeFoliage               treeFoliageResources
-	Trees                     []treeInstance
+	BuildingRegions []buildingRegion
+	BuildingCount   int
+	TreeFoliage     treeFoliageResources
+	Trees           []treeInstance
 }
 
 type buildingRegion struct {
-	Path              string
-	Model             streamedBuildingModel
-	PendingUpload     *buildingRegionUpload
-	Position          rl.Vector3
-	Bounds            rl.BoundingBox
-	CenterX           float32
-	CenterZ           float32
-	Radius            float32
-	BuildingCount     int
-	Loaded            bool
-	Loading           bool
-	LoadFailed        bool
-	WarnedLoadFailure bool
+	Path          string
+	Model         streamedBuildingModel
+	Position      rl.Vector3
+	BuildingCount int
 }
 
 type buildingRegionMetadata struct {
 	OriginEPSG2180 []float64 `json:"origin_epsg2180"`
 	Buildings      int
-	Bounds         rl.BoundingBox
-}
-
-type buildingRegionLoadJob struct {
-	Index int
-	Path  string
-}
-
-type buildingRegionLoadResult struct {
-	Index int
-	Path  string
-	Data  parsedBuildingGLB
-	Err   error
 }
 
 type parsedBuildingGLB struct {
@@ -129,53 +102,79 @@ type treeRenderStyle struct {
 	OffsetZ     float32
 }
 
-func loadSceneObjects(mapDef *mapDefinition, terrain *terrainData) (*sceneObjects, error) {
-	objects := &sceneObjects{
-		buildingLoadJobs:    make(chan buildingRegionLoadJob, 32),
-		buildingLoadResults: make(chan buildingRegionLoadResult, 32),
-		buildingLoadDone:    make(chan struct{}),
-	}
-	var problems []error
+type sceneCPUData struct {
+	ParsedRegions []parsedBuildingRegion
+	Trees         []treeInstance
+	FoliageAtlas  *image.NRGBA
+	Problems      []error
+}
 
-	regions, buildingCount, err := loadBuildingRegions(mapDef.BuildingGLBPaths, terrain)
-	if err != nil {
-		problems = append(problems, err)
-	}
-	objects.BuildingRegions = regions
-	objects.BuildingCount = buildingCount
+type parsedBuildingRegion struct {
+	Path          string
+	Position      rl.Vector3
+	BuildingCount int
+	Data          parsedBuildingGLB
+}
 
+func prepareSceneCPU(mapDef *mapDefinition, terrain *terrainData, progress func(string)) *sceneCPUData {
+	out := &sceneCPUData{}
+
+	if progress != nil {
+		progress("parsing buildings")
+	}
+	parsed, problems := parseBuildingRegions(mapDef.BuildingGLBPaths, terrain)
+	out.ParsedRegions = parsed
+	out.Problems = append(out.Problems, problems...)
+
+	if progress != nil {
+		progress("loading trees")
+	}
 	for _, path := range mapDef.TreePaths {
 		trees, err := loadTreeInstances(path, terrain)
 		if err != nil {
-			problems = append(problems, fmt.Errorf("%s: %w", filepath.Base(path), err))
+			out.Problems = append(out.Problems, fmt.Errorf("%s: %w", filepath.Base(path), err))
 			continue
 		}
-		objects.Trees = append(objects.Trees, trees...)
+		out.Trees = append(out.Trees, trees...)
 	}
-	if len(objects.Trees) > 0 {
-		objects.TreeFoliage = generateTreeFoliageResources(objects.Trees)
+	if len(out.Trees) > 0 {
+		if progress != nil {
+			progress("generating foliage")
+		}
+		out.FoliageAtlas = buildFoliageAtlas()
 	}
-	for i := 0; i < buildingRegionLoaderWorkers; i++ {
-		go buildingRegionLoader(objects.buildingLoadJobs, objects.buildingLoadResults, objects.buildingLoadDone)
-	}
+	return out
+}
 
-	return objects, errors.Join(problems...)
+func loadSceneObjects(mapDef *mapDefinition, terrain *terrainData) (*sceneObjects, error) {
+	cpu := prepareSceneCPU(mapDef, terrain, nil)
+	objects := &sceneObjects{Trees: cpu.Trees}
+	for _, region := range cpu.ParsedRegions {
+		model, err := uploadParsedBuildingGLB(region.Data)
+		if err != nil {
+			cpu.Problems = append(cpu.Problems, fmt.Errorf("%s: %w", filepath.Base(region.Path), err))
+			continue
+		}
+		objects.BuildingRegions = append(objects.BuildingRegions, buildingRegion{
+			Path:          region.Path,
+			Position:      region.Position,
+			Model:         model,
+			BuildingCount: region.BuildingCount,
+		})
+		objects.BuildingCount += region.BuildingCount
+	}
+	if len(objects.Trees) > 0 && cpu.FoliageAtlas != nil {
+		objects.TreeFoliage = uploadTreeFoliage(cpu.FoliageAtlas, objects.Trees)
+	}
+	return objects, errors.Join(cpu.Problems...)
 }
 
 func unloadSceneObjects(objects *sceneObjects) {
 	if objects == nil {
 		return
 	}
-	if objects.buildingLoadDone != nil {
-		close(objects.buildingLoadDone)
-	}
 	for _, region := range objects.BuildingRegions {
-		if region.Loaded {
-			unloadStreamedBuildingModel(region.Model)
-		}
-		if region.PendingUpload != nil {
-			unloadStreamedBuildingModel(region.PendingUpload.Model)
-		}
+		unloadStreamedBuildingModel(region.Model)
 	}
 	if objects.TreeFoliage.Loaded {
 		rl.UnloadMesh(&objects.TreeFoliage.Mesh)
@@ -188,11 +187,8 @@ func drawSceneObjects(camera rl.Camera, objects *sceneObjects) {
 	if objects == nil {
 		return
 	}
-	updateBuildingRegionStreaming(camera, objects)
 	for _, region := range objects.BuildingRegions {
-		if region.Loaded {
-			drawStreamedBuildingModel(region.Model, region.Position)
-		}
+		drawStreamedBuildingModel(region.Model, region.Position)
 	}
 
 	visibleTrees := visibleTreesForCamera(camera, objects.Trees)
@@ -264,22 +260,23 @@ func drawTreeFoliage(foliage treeFoliageResources, visibleTrees []visibleTreeDra
 
 	rl.BeginBlendMode(rl.BlendAlpha)
 	rl.DisableBackfaceCulling()
-	rl.DisableDepthMask()
 	rl.DrawMesh(foliage.Mesh, foliage.Material, rl.MatrixIdentity())
-	rl.EnableDepthMask()
 	rl.EnableBackfaceCulling()
 	rl.EndBlendMode()
 }
 
-func generateTreeFoliageResources(trees []treeInstance) treeFoliageResources {
-	const spriteSize = int32(128)
-	const variantCount = 10
+const foliageSpriteSize = 128
+const foliageVariantCount = 10
 
-	atlas := image.NewNRGBA(image.Rect(0, 0, int(spriteSize)*variantCount, int(spriteSize)))
-	for variant := 0; variant < variantCount; variant++ {
-		drawGeneratedFoliageSprite(atlas, int(spriteSize), variant)
+func buildFoliageAtlas() *image.NRGBA {
+	atlas := image.NewNRGBA(image.Rect(0, 0, foliageSpriteSize*foliageVariantCount, foliageSpriteSize))
+	for variant := 0; variant < foliageVariantCount; variant++ {
+		drawGeneratedFoliageSprite(atlas, foliageSpriteSize, variant)
 	}
+	return atlas
+}
 
+func uploadTreeFoliage(atlas *image.NRGBA, trees []treeInstance) treeFoliageResources {
 	imageData := rl.NewImageFromImage(atlas)
 	texture := rl.LoadTextureFromImage(imageData)
 	rl.UnloadImage(imageData)
@@ -290,7 +287,7 @@ func generateTreeFoliageResources(trees []treeInstance) treeFoliageResources {
 	rl.SetTextureFilter(texture, rl.FilterTrilinear)
 	rl.SetTextureWrap(texture, rl.WrapClamp)
 
-	mesh := buildTreeFoliageMesh(trees, variantCount)
+	mesh := buildTreeFoliageMesh(trees, foliageVariantCount)
 	if mesh.VertexCount == 0 {
 		rl.UnloadTexture(texture)
 		return treeFoliageResources{}
@@ -512,233 +509,100 @@ func mixUint32(value uint32) uint32 {
 	return value
 }
 
-const (
-	buildingRegionBaseLoadRadius    = float32(900)
-	buildingRegionUnloadMargin      = float32(350)
-	buildingRegionMaxLoadRadius     = float32(1800)
-	buildingRegionLoadsPerFrame     = 1
-	buildingRegionUploadOpsPerFrame = 1
-	buildingRegionResultsPerFrame   = 8
-	buildingRegionLoaderWorkers     = 2
-	buildingRegionMinBoundsRadius   = float32(1)
-	streamedBuildingTextureMaxDim   = 512
-)
-
-func loadBuildingRegions(glbPaths []string, terrain *terrainData) ([]buildingRegion, int, error) {
-	regions := make([]buildingRegion, 0, len(glbPaths))
-	totalBuildingCount := 0
-	var problems []error
-
-	for _, modelPath := range glbPaths {
-		metadata, err := readBuildingGLBMetadata(modelPath)
-		if err != nil {
-			problems = append(problems, fmt.Errorf("%s: %w", filepath.Base(modelPath), err))
-			continue
-		}
-
-		position := buildingRegionPosition(terrain, metadata.OriginEPSG2180)
-		if !buildingRegionIntersectsTerrain(terrain, metadata.OriginEPSG2180, metadata.Bounds) {
-			continue
-		}
-
-		centerX := position.X + (metadata.Bounds.Min.X+metadata.Bounds.Max.X)*0.5
-		centerZ := position.Z + (metadata.Bounds.Min.Z+metadata.Bounds.Max.Z)*0.5
-		halfX := (metadata.Bounds.Max.X - metadata.Bounds.Min.X) * 0.5
-		halfZ := (metadata.Bounds.Max.Z - metadata.Bounds.Min.Z) * 0.5
-		radius := float32(math.Sqrt(float64(halfX*halfX + halfZ*halfZ)))
-		if radius < buildingRegionMinBoundsRadius {
-			radius = buildingRegionMinBoundsRadius
-		}
-
-		regions = append(regions, buildingRegion{
-			Path:          modelPath,
-			Position:      position,
-			Bounds:        metadata.Bounds,
-			CenterX:       centerX,
-			CenterZ:       centerZ,
-			Radius:        radius,
-			BuildingCount: metadata.Buildings,
-		})
-		totalBuildingCount += metadata.Buildings
+func parseBuildingRegions(glbPaths []string, terrain *terrainData) ([]parsedBuildingRegion, []error) {
+	type parseResult struct {
+		Index    int
+		Path     string
+		Position rl.Vector3
+		Stats    int
+		Data     parsedBuildingGLB
+		Err      error
 	}
 
-	if len(glbPaths) > 0 && len(regions) == 0 && len(problems) == 0 {
-		return nil, 0, fmt.Errorf("no building GLB regions intersect the active terrain")
+	workerCount := runtime.NumCPU()
+	if workerCount > len(glbPaths) {
+		workerCount = len(glbPaths)
+	}
+	if workerCount < 1 {
+		workerCount = 1
 	}
 
-	return regions, totalBuildingCount, errors.Join(problems...)
-}
-
-type buildingRegionLoadCandidate struct {
-	Index    int
-	Distance float32
-}
-
-func updateBuildingRegionStreaming(camera rl.Camera, objects *sceneObjects) {
-	loadRadius, unloadRadius := buildingRegionStreamingRadii(camera)
-	consumeBuildingRegionLoadResults(camera, unloadRadius, objects)
-
-	var candidates []buildingRegionLoadCandidate
-	loadedRegions := 0
-	loadedBuildings := 0
-
-	for i := range objects.BuildingRegions {
-		region := &objects.BuildingRegions[i]
-		distance := buildingRegionDistance(camera.Position.X, camera.Position.Z, region)
-
-		if region.PendingUpload != nil && distance > unloadRadius {
-			unloadStreamedBuildingModel(region.PendingUpload.Model)
-			region.PendingUpload = nil
-		}
-
-		if region.Loaded {
-			if distance > unloadRadius {
-				unloadStreamedBuildingModel(region.Model)
-				region.Model = streamedBuildingModel{}
-				region.Loaded = false
-			} else {
-				loadedRegions++
-				loadedBuildings += region.BuildingCount
-			}
-			continue
-		}
-
-		if !region.Loading && region.PendingUpload == nil && !region.LoadFailed && distance <= loadRadius {
-			candidates = append(candidates, buildingRegionLoadCandidate{
-				Index:    i,
-				Distance: distance,
-			})
-		}
-	}
-
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].Distance < candidates[j].Distance
-	})
-
-	loadsThisFrame := 0
-	for _, candidate := range candidates {
-		if loadsThisFrame >= buildingRegionLoadsPerFrame {
-			break
-		}
-
-		region := &objects.BuildingRegions[candidate.Index]
-		if queueBuildingRegionLoad(objects, candidate.Index, region.Path) {
-			region.Loading = true
-			loadsThisFrame++
-		}
-	}
-
-	objects.LoadedBuildingRegionCount = loadedRegions
-	objects.LoadedBuildingCount = loadedBuildings
-}
-
-func queueBuildingRegionLoad(objects *sceneObjects, index int, path string) bool {
-	select {
-	case objects.buildingLoadJobs <- buildingRegionLoadJob{Index: index, Path: path}:
-		return true
-	default:
-		return false
-	}
-}
-
-func consumeBuildingRegionLoadResults(camera rl.Camera, unloadRadius float32, objects *sceneObjects) {
-	drainBuildingRegionLoadResults(camera, unloadRadius, objects)
-
-	uploads := 0
-	for i := range objects.BuildingRegions {
-		if uploads >= buildingRegionUploadOpsPerFrame {
-			break
-		}
-		region := &objects.BuildingRegions[i]
-		if region.PendingUpload == nil {
-			continue
-		}
-		if buildingRegionDistance(camera.Position.X, camera.Position.Z, region) > unloadRadius {
-			unloadStreamedBuildingModel(region.PendingUpload.Model)
-			region.PendingUpload = nil
-			continue
-		}
-
-		done, err := advanceBuildingRegionUpload(region.PendingUpload)
-		uploads++
-		if err != nil {
-			unloadStreamedBuildingModel(region.PendingUpload.Model)
-			region.PendingUpload = nil
-			region.LoadFailed = true
-			if !region.WarnedLoadFailure {
-				fmt.Fprintf(os.Stderr, "warning: failed to upload building GLB %s: %v\n", region.Path, err)
-				region.WarnedLoadFailure = true
-			}
-			continue
-		}
-		if done {
-			region.Model = region.PendingUpload.Model
-			region.PendingUpload = nil
-			region.Loaded = true
-		}
-	}
-}
-
-func drainBuildingRegionLoadResults(camera rl.Camera, unloadRadius float32, objects *sceneObjects) {
-	for results := 0; results < buildingRegionResultsPerFrame; results++ {
-		select {
-		case result := <-objects.buildingLoadResults:
-			if result.Index < 0 || result.Index >= len(objects.BuildingRegions) {
-				continue
-			}
-			region := &objects.BuildingRegions[result.Index]
-			if region.Path != result.Path {
-				continue
-			}
-			region.Loading = false
-			if result.Err != nil {
-				region.LoadFailed = true
-				if !region.WarnedLoadFailure {
-					fmt.Fprintf(os.Stderr, "warning: failed to stream building GLB %s: %v\n", region.Path, result.Err)
-					region.WarnedLoadFailure = true
+	jobs := make(chan int, len(glbPaths))
+	results := make(chan parseResult, len(glbPaths))
+	var wg sync.WaitGroup
+	for w := 0; w < workerCount; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				path := glbPaths[idx]
+				data, metadata, err := parseBuildingGLBWithMetadata(path)
+				if err != nil {
+					results <- parseResult{Index: idx, Path: path, Err: err}
+					continue
 				}
-				continue
+				results <- parseResult{
+					Index:    idx,
+					Path:     path,
+					Position: buildingRegionPosition(terrain, metadata.OriginEPSG2180),
+					Stats:    metadata.Buildings,
+					Data:     data,
+				}
 			}
-
-			if buildingRegionDistance(camera.Position.X, camera.Position.Z, region) > unloadRadius {
-				continue
-			}
-			if region.PendingUpload != nil {
-				unloadStreamedBuildingModel(region.PendingUpload.Model)
-			}
-			region.PendingUpload = newBuildingRegionUpload(result.Data)
-		default:
-			return
-		}
+		}()
 	}
+	for i := range glbPaths {
+		jobs <- i
+	}
+	close(jobs)
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	parsed := make([]parsedBuildingRegion, 0, len(glbPaths))
+	var problems []error
+	for result := range results {
+		if result.Err != nil {
+			problems = append(problems, fmt.Errorf("%s: %w", filepath.Base(result.Path), result.Err))
+			continue
+		}
+		parsed = append(parsed, parsedBuildingRegion{
+			Path:          result.Path,
+			Position:      result.Position,
+			BuildingCount: result.Stats,
+			Data:          result.Data,
+		})
+	}
+	return parsed, problems
 }
 
-func buildingRegionLoader(jobs <-chan buildingRegionLoadJob, results chan<- buildingRegionLoadResult, done <-chan struct{}) {
-	for {
-		select {
-		case <-done:
-			return
-		case job := <-jobs:
-			data, err := parseBuildingGLB(job.Path)
-			result := buildingRegionLoadResult{Index: job.Index, Path: job.Path, Data: data, Err: err}
-			select {
-			case results <- result:
-			case <-done:
-				return
-			}
-		}
-	}
-}
-
-func parseBuildingGLB(path string) (parsedBuildingGLB, error) {
+func parseBuildingGLBWithMetadata(path string) (parsedBuildingGLB, buildingRegionMetadata, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return parsedBuildingGLB{}, fmt.Errorf("read GLB: %w", err)
+		return parsedBuildingGLB{}, buildingRegionMetadata{}, fmt.Errorf("read GLB: %w", err)
 	}
 	doc, bin, err := parseGLBChunks(raw)
 	if err != nil {
-		return parsedBuildingGLB{}, err
+		return parsedBuildingGLB{}, buildingRegionMetadata{}, err
 	}
+
+	if len(doc.Extras.OriginEPSG2180) < 3 {
+		return parsedBuildingGLB{}, buildingRegionMetadata{}, errors.New("missing origin_epsg2180")
+	}
+	metadata := buildingRegionMetadata{
+		OriginEPSG2180: doc.Extras.OriginEPSG2180,
+		Buildings:      doc.Extras.Stats.Buildings,
+	}
+
+	parsed, err := buildParsedGLB(doc, bin)
+	if err != nil {
+		return parsedBuildingGLB{}, buildingRegionMetadata{}, err
+	}
+	return parsed, metadata, nil
+}
+
+func buildParsedGLB(doc buildingGLBDocument, bin []byte) (parsedBuildingGLB, error) {
 
 	materials, err := parseBuildingMaterials(doc, bin)
 	if err != nil {
@@ -803,6 +667,12 @@ func parseBuildingGLB(path string) (parsedBuildingGLB, error) {
 }
 
 type buildingGLBDocument struct {
+	Extras struct {
+		OriginEPSG2180 []float64 `json:"origin_epsg2180"`
+		Stats          struct {
+			Buildings int `json:"buildings"`
+		} `json:"stats"`
+	} `json:"extras"`
 	BufferViews []struct {
 		Buffer     int `json:"buffer"`
 		ByteOffset int `json:"byteOffset"`
@@ -927,7 +797,7 @@ func parseBuildingMaterials(doc buildingGLBDocument, bin []byte) ([]parsedBuildi
 		if err != nil {
 			return nil, fmt.Errorf("decode material image: %w", err)
 		}
-		materials[i].TextureImage = downscaleImageNearest(img, streamedBuildingTextureMaxDim)
+		materials[i].TextureImage = img
 	}
 	return materials, nil
 }
@@ -1096,7 +966,8 @@ func advanceBuildingRegionUpload(upload *buildingRegionUpload) (bool, error) {
 			texture := rl.LoadTextureFromImage(imageData)
 			rl.UnloadImage(imageData)
 			if texture.ID != 0 {
-				rl.SetTextureFilter(texture, rl.FilterBilinear)
+				rl.GenTextureMipmaps(&texture)
+				rl.SetTextureFilter(texture, rl.FilterTrilinear)
 				rl.SetTextureWrap(texture, rl.WrapClamp)
 				rl.SetMaterialTexture(&rlMaterial, rl.MapAlbedo, texture)
 				upload.Model.Textures = append(upload.Model.Textures, texture)
@@ -1164,31 +1035,6 @@ func uploadParsedBuildingGLB(data parsedBuildingGLB) (streamedBuildingModel, err
 	}
 }
 
-func downscaleImageNearest(src image.Image, maxDim int) image.Image {
-	bounds := src.Bounds()
-	width := bounds.Dx()
-	height := bounds.Dy()
-	if maxDim <= 0 || width <= 0 || height <= 0 || (width <= maxDim && height <= maxDim) {
-		return src
-	}
-
-	scale := float64(maxDim) / float64(max(width, height))
-	dstWidth := max(1, int(math.Round(float64(width)*scale)))
-	dstHeight := max(1, int(math.Round(float64(height)*scale)))
-	dst := image.NewNRGBA(image.Rect(0, 0, dstWidth, dstHeight))
-
-	for y := 0; y < dstHeight; y++ {
-		srcY := bounds.Min.Y + min(height-1, int(float64(y)*float64(height)/float64(dstHeight)))
-		for x := 0; x < dstWidth; x++ {
-			srcX := bounds.Min.X + min(width-1, int(float64(x)*float64(width)/float64(dstWidth)))
-			c := color.NRGBAModel.Convert(src.At(srcX, srcY)).(color.NRGBA)
-			dst.SetNRGBA(x, y, c)
-		}
-	}
-
-	return dst
-}
-
 func drawStreamedBuildingModel(model streamedBuildingModel, position rl.Vector3) {
 	if len(model.Materials) == 0 {
 		return
@@ -1224,162 +1070,9 @@ func unloadStreamedBuildingModel(model streamedBuildingModel) {
 	}
 }
 
-func buildingRegionStreamingRadii(camera rl.Camera) (float32, float32) {
-	loadRadius := buildingRegionBaseLoadRadius
-	if camera.Position.Y > 140 {
-		loadRadius += (camera.Position.Y - 140) * 1.4
-	}
-	if loadRadius > buildingRegionMaxLoadRadius {
-		loadRadius = buildingRegionMaxLoadRadius
-	}
-	return loadRadius, loadRadius + buildingRegionUnloadMargin
-}
-
-func buildingRegionDistance(cameraX, cameraZ float32, region *buildingRegion) float32 {
-	dx := cameraX - region.CenterX
-	dz := cameraZ - region.CenterZ
-	centerDistance := float32(math.Sqrt(float64(dx*dx + dz*dz)))
-	distance := centerDistance - region.Radius
-	if distance < 0 {
-		return 0
-	}
-	return distance
-}
-
-func readBuildingGLBMetadata(path string) (buildingRegionMetadata, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return buildingRegionMetadata{}, fmt.Errorf("open GLB: %w", err)
-	}
-	defer file.Close()
-
-	var header struct {
-		Magic   uint32
-		Version uint32
-		Length  uint32
-	}
-	if err := binary.Read(file, binary.LittleEndian, &header); err != nil {
-		return buildingRegionMetadata{}, fmt.Errorf("read GLB header: %w", err)
-	}
-	if header.Magic != 0x46546c67 || header.Version != 2 {
-		return buildingRegionMetadata{}, errors.New("unsupported GLB header")
-	}
-
-	var chunkLength uint32
-	var chunkType uint32
-	if err := binary.Read(file, binary.LittleEndian, &chunkLength); err != nil {
-		return buildingRegionMetadata{}, fmt.Errorf("read GLB JSON chunk length: %w", err)
-	}
-	if err := binary.Read(file, binary.LittleEndian, &chunkType); err != nil {
-		return buildingRegionMetadata{}, fmt.Errorf("read GLB JSON chunk type: %w", err)
-	}
-	if chunkType != 0x4e4f534a {
-		return buildingRegionMetadata{}, errors.New("first GLB chunk is not JSON")
-	}
-
-	jsonBytes := make([]byte, chunkLength)
-	if _, err := io.ReadFull(file, jsonBytes); err != nil {
-		return buildingRegionMetadata{}, fmt.Errorf("read GLB JSON chunk: %w", err)
-	}
-
-	var document struct {
-		Extras struct {
-			OriginEPSG2180 []float64 `json:"origin_epsg2180"`
-			Stats          struct {
-				Buildings int `json:"buildings"`
-			} `json:"stats"`
-		} `json:"extras"`
-		Accessors []struct {
-			Min  []float64 `json:"min"`
-			Max  []float64 `json:"max"`
-			Type string    `json:"type"`
-		} `json:"accessors"`
-		Meshes []struct {
-			Primitives []struct {
-				Attributes map[string]int `json:"attributes"`
-			} `json:"primitives"`
-		} `json:"meshes"`
-	}
-	if err := json.NewDecoder(bytes.NewReader(jsonBytes)).Decode(&document); err != nil {
-		return buildingRegionMetadata{}, fmt.Errorf("decode GLB JSON metadata: %w", err)
-	}
-	if len(document.Extras.OriginEPSG2180) < 3 {
-		return buildingRegionMetadata{}, errors.New("missing origin_epsg2180")
-	}
-	bounds, ok := glbPositionBounds(document.Accessors, document.Meshes)
-	if !ok {
-		return buildingRegionMetadata{}, errors.New("missing POSITION bounds")
-	}
-
-	return buildingRegionMetadata{
-		OriginEPSG2180: document.Extras.OriginEPSG2180,
-		Buildings:      document.Extras.Stats.Buildings,
-		Bounds:         bounds,
-	}, nil
-}
-
-func glbPositionBounds(
-	accessors []struct {
-		Min  []float64 `json:"min"`
-		Max  []float64 `json:"max"`
-		Type string    `json:"type"`
-	},
-	meshes []struct {
-		Primitives []struct {
-			Attributes map[string]int `json:"attributes"`
-		} `json:"primitives"`
-	},
-) (rl.BoundingBox, bool) {
-	minX := math.MaxFloat64
-	minY := math.MaxFloat64
-	minZ := math.MaxFloat64
-	maxX := -math.MaxFloat64
-	maxY := -math.MaxFloat64
-	maxZ := -math.MaxFloat64
-	found := false
-
-	for _, mesh := range meshes {
-		for _, primitive := range mesh.Primitives {
-			accessorIndex, ok := primitive.Attributes["POSITION"]
-			if !ok || accessorIndex < 0 || accessorIndex >= len(accessors) {
-				continue
-			}
-			accessor := accessors[accessorIndex]
-			if accessor.Type != "VEC3" || len(accessor.Min) < 3 || len(accessor.Max) < 3 {
-				continue
-			}
-
-			minX = math.Min(minX, accessor.Min[0])
-			minY = math.Min(minY, accessor.Min[1])
-			minZ = math.Min(minZ, accessor.Min[2])
-			maxX = math.Max(maxX, accessor.Max[0])
-			maxY = math.Max(maxY, accessor.Max[1])
-			maxZ = math.Max(maxZ, accessor.Max[2])
-			found = true
-		}
-	}
-	if !found {
-		return rl.BoundingBox{}, false
-	}
-
-	return rl.NewBoundingBox(
-		rl.NewVector3(float32(minX), float32(minY), float32(minZ)),
-		rl.NewVector3(float32(maxX), float32(maxY), float32(maxZ)),
-	), true
-}
-
 func buildingRegionPosition(terrain *terrainData, origin []float64) rl.Vector3 {
 	localX, localZ := terrainLocalXZ(terrain, origin[0], origin[1])
 	return rl.NewVector3(localX, float32(origin[2]-terrain.centerWorldZ), localZ)
-}
-
-func buildingRegionIntersectsTerrain(terrain *terrainData, origin []float64, bounds rl.BoundingBox) bool {
-	minWorldX := origin[0] + float64(bounds.Min.X)
-	maxWorldX := origin[0] + float64(bounds.Max.X)
-	minWorldY := origin[1] - float64(bounds.Max.Z)
-	maxWorldY := origin[1] - float64(bounds.Min.Z)
-
-	return terrainIntersectsBounds(terrain, minWorldX, maxWorldX, minWorldY, maxWorldY)
 }
 
 func loadTreeInstances(treePath string, terrain *terrainData) ([]treeInstance, error) {
