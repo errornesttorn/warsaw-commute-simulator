@@ -9,14 +9,13 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"io"
 	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 
 	rl "github.com/gen2brain/raylib-go/raylib"
 )
@@ -26,6 +25,7 @@ type sceneObjects struct {
 	BuildingCount   int
 	TreeFoliage     treeFoliageResources
 	Trees           []treeInstance
+	streaming       *buildingStreaming
 }
 
 type buildingRegion struct {
@@ -33,6 +33,7 @@ type buildingRegion struct {
 	Model         streamedBuildingModel
 	Position      rl.Vector3
 	BuildingCount int
+	State         buildingRegionState
 }
 
 type buildingRegionMetadata struct {
@@ -99,33 +100,27 @@ type treeRenderStyle struct {
 	Variant     int
 	WidthScale  float32
 	HeightScale float32
+	LogRatio    float32
 	Tint        rl.Color
 	OffsetX     float32
 	OffsetZ     float32
 }
 
 type sceneCPUData struct {
-	ParsedRegions []parsedBuildingRegion
-	Trees         []treeInstance
-	FoliageAtlas  *image.NRGBA
-	Problems      []error
-}
-
-type parsedBuildingRegion struct {
-	Path          string
-	Position      rl.Vector3
-	BuildingCount int
-	Data          parsedBuildingGLB
+	Regions      []buildingRegion
+	Trees        []treeInstance
+	FoliageAtlas *image.NRGBA
+	Problems     []error
 }
 
 func prepareSceneCPU(mapDef *mapDefinition, terrain *terrainData, progress func(string)) *sceneCPUData {
 	out := &sceneCPUData{}
 
 	if progress != nil {
-		progress("parsing buildings")
+		progress("scanning building regions")
 	}
-	parsed, problems := parseBuildingRegions(mapDef.BuildingGLBPaths, terrain)
-	out.ParsedRegions = parsed
+	regions, problems := parseBuildingRegionsMetadata(mapDef.BuildingGLBPaths, terrain)
+	out.Regions = regions
 	out.Problems = append(out.Problems, problems...)
 
 	if progress != nil {
@@ -148,35 +143,14 @@ func prepareSceneCPU(mapDef *mapDefinition, terrain *terrainData, progress func(
 	return out
 }
 
-func loadSceneObjects(mapDef *mapDefinition, terrain *terrainData) (*sceneObjects, error) {
-	cpu := prepareSceneCPU(mapDef, terrain, nil)
-	objects := &sceneObjects{Trees: cpu.Trees}
-	for _, region := range cpu.ParsedRegions {
-		model, err := uploadParsedBuildingGLB(region.Data)
-		if err != nil {
-			cpu.Problems = append(cpu.Problems, fmt.Errorf("%s: %w", filepath.Base(region.Path), err))
-			continue
-		}
-		objects.BuildingRegions = append(objects.BuildingRegions, buildingRegion{
-			Path:          region.Path,
-			Position:      region.Position,
-			Model:         model,
-			BuildingCount: region.BuildingCount,
-		})
-		objects.BuildingCount += region.BuildingCount
-	}
-	if len(objects.Trees) > 0 && cpu.FoliageAtlas != nil {
-		objects.TreeFoliage = uploadTreeFoliage(cpu.FoliageAtlas, objects.Trees)
-	}
-	return objects, errors.Join(cpu.Problems...)
-}
-
 func unloadSceneObjects(objects *sceneObjects) {
 	if objects == nil {
 		return
 	}
-	for _, region := range objects.BuildingRegions {
-		unloadStreamedBuildingModel(region.Model)
+	stopBuildingStreaming(objects)
+	for i := range objects.BuildingRegions {
+		unloadStreamedBuildingModel(objects.BuildingRegions[i].Model)
+		objects.BuildingRegions[i].Model = streamedBuildingModel{}
 	}
 	if objects.TreeFoliage.Loaded {
 		rl.UnloadMesh(&objects.TreeFoliage.Mesh)
@@ -190,7 +164,11 @@ func drawSceneObjects(camera rl.Camera, objects *sceneObjects) {
 	if objects == nil {
 		return
 	}
-	for _, region := range objects.BuildingRegions {
+	for i := range objects.BuildingRegions {
+		region := &objects.BuildingRegions[i]
+		if region.State != regionStateLoaded {
+			continue
+		}
 		drawStreamedBuildingModel(region.Model, region.Position)
 	}
 
@@ -230,8 +208,9 @@ func drawTreeTrunks(visibleTrees []visibleTreeDraw) {
 	trunkColor := rl.NewColor(103, 76, 46, 255)
 	for _, visible := range visibleTrees {
 		tree := visible.Tree
+		style := treeRenderStyleFor(tree)
 
-		trunkHeight := tree.Height * 0.28
+		trunkHeight := tree.Height * style.LogRatio
 		if trunkHeight < 1.4 {
 			trunkHeight = 1.4
 		}
@@ -245,7 +224,8 @@ func drawTreeFoliage(foliage treeFoliageResources, visibleTrees []visibleTreeDra
 	if !foliage.Loaded {
 		for _, visible := range visibleTrees {
 			tree := visible.Tree
-			trunkHeight := tree.Height * 0.28
+			style := treeRenderStyleFor(tree)
+			trunkHeight := tree.Height * style.LogRatio
 			if trunkHeight < 1.4 {
 				trunkHeight = 1.4
 			}
@@ -473,7 +453,7 @@ func buildTreeFoliageMesh(trees []treeInstance, variantCount int) rl.Mesh {
 
 	for _, tree := range trees {
 		style := treeRenderStyleFor(tree)
-		trunkHeight := tree.Height * 0.28
+		trunkHeight := tree.Height * style.LogRatio
 		if trunkHeight < 1.4 {
 			trunkHeight = 1.4
 		}
@@ -561,6 +541,7 @@ func treeRenderStyleFor(tree treeInstance) treeRenderStyle {
 		Variant:     int(seed % 10),
 		WidthScale:  0.9 + seededUnit(seed, 5)*0.28,
 		HeightScale: 0.92 + seededUnit(seed, 9)*0.2,
+		LogRatio:    0.30 + float32(seededUnit(seed, 45)*0.20),
 		Tint: rl.NewColor(
 			uint8(226+seededUnit(seed, 13)*24),
 			uint8(232+seededUnit(seed, 17)*20),
@@ -597,72 +578,79 @@ func mixUint32(value uint32) uint32 {
 	return value
 }
 
-func parseBuildingRegions(glbPaths []string, terrain *terrainData) ([]parsedBuildingRegion, []error) {
-	type parseResult struct {
-		Index    int
-		Path     string
-		Position rl.Vector3
-		Stats    int
-		Data     parsedBuildingGLB
-		Err      error
-	}
-
-	workerCount := runtime.NumCPU()
-	if workerCount > len(glbPaths) {
-		workerCount = len(glbPaths)
-	}
-	if workerCount < 1 {
-		workerCount = 1
-	}
-
-	jobs := make(chan int, len(glbPaths))
-	results := make(chan parseResult, len(glbPaths))
-	var wg sync.WaitGroup
-	for w := 0; w < workerCount; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for idx := range jobs {
-				path := glbPaths[idx]
-				data, metadata, err := parseBuildingGLBWithMetadata(path)
-				if err != nil {
-					results <- parseResult{Index: idx, Path: path, Err: err}
-					continue
-				}
-				results <- parseResult{
-					Index:    idx,
-					Path:     path,
-					Position: buildingRegionPosition(terrain, metadata.OriginEPSG2180),
-					Stats:    metadata.Buildings,
-					Data:     data,
-				}
-			}
-		}()
-	}
-	for i := range glbPaths {
-		jobs <- i
-	}
-	close(jobs)
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	parsed := make([]parsedBuildingRegion, 0, len(glbPaths))
+// parseBuildingRegionsMetadata reads only the JSON chunk of each GLB so we
+// learn its origin and building count without paying for vertex/texture
+// decoding. The actual mesh+material data is parsed lazily by the streaming
+// worker once the camera comes within range.
+func parseBuildingRegionsMetadata(glbPaths []string, terrain *terrainData) ([]buildingRegion, []error) {
+	regions := make([]buildingRegion, 0, len(glbPaths))
 	var problems []error
-	for result := range results {
-		if result.Err != nil {
-			problems = append(problems, fmt.Errorf("%s: %w", filepath.Base(result.Path), result.Err))
+	for _, path := range glbPaths {
+		meta, err := parseBuildingGLBMetadataOnly(path)
+		if err != nil {
+			problems = append(problems, fmt.Errorf("%s: %w", filepath.Base(path), err))
 			continue
 		}
-		parsed = append(parsed, parsedBuildingRegion{
-			Path:          result.Path,
-			Position:      result.Position,
-			BuildingCount: result.Stats,
-			Data:          result.Data,
+		regions = append(regions, buildingRegion{
+			Path:          path,
+			Position:      buildingRegionPosition(terrain, meta.OriginEPSG2180),
+			BuildingCount: meta.Buildings,
+			State:         regionStateUnloaded,
 		})
 	}
-	return parsed, problems
+	return regions, problems
+}
+
+func parseBuildingGLBMetadataOnly(path string) (buildingRegionMetadata, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return buildingRegionMetadata{}, fmt.Errorf("open GLB: %w", err)
+	}
+	defer f.Close()
+
+	var hdr [12]byte
+	if _, err := io.ReadFull(f, hdr[:]); err != nil {
+		return buildingRegionMetadata{}, fmt.Errorf("read GLB header: %w", err)
+	}
+	if string(hdr[0:4]) != "glTF" {
+		return buildingRegionMetadata{}, errors.New("unsupported GLB magic")
+	}
+	if binary.LittleEndian.Uint32(hdr[4:8]) != 2 {
+		return buildingRegionMetadata{}, errors.New("unsupported GLB version")
+	}
+
+	var chunkHdr [8]byte
+	if _, err := io.ReadFull(f, chunkHdr[:]); err != nil {
+		return buildingRegionMetadata{}, fmt.Errorf("read JSON chunk header: %w", err)
+	}
+	jsonLen := binary.LittleEndian.Uint32(chunkHdr[0:4])
+	if binary.LittleEndian.Uint32(chunkHdr[4:8]) != 0x4e4f534a {
+		return buildingRegionMetadata{}, errors.New("first GLB chunk is not JSON")
+	}
+
+	jsonBytes := make([]byte, jsonLen)
+	if _, err := io.ReadFull(f, jsonBytes); err != nil {
+		return buildingRegionMetadata{}, fmt.Errorf("read JSON: %w", err)
+	}
+
+	var doc struct {
+		Extras struct {
+			OriginEPSG2180 []float64 `json:"origin_epsg2180"`
+			Stats          struct {
+				Buildings int `json:"buildings"`
+			} `json:"stats"`
+		} `json:"extras"`
+	}
+	if err := json.Unmarshal(jsonBytes, &doc); err != nil {
+		return buildingRegionMetadata{}, fmt.Errorf("decode JSON: %w", err)
+	}
+	if len(doc.Extras.OriginEPSG2180) < 3 {
+		return buildingRegionMetadata{}, errors.New("missing origin_epsg2180")
+	}
+	return buildingRegionMetadata{
+		OriginEPSG2180: doc.Extras.OriginEPSG2180,
+		Buildings:      doc.Extras.Stats.Buildings,
+	}, nil
 }
 
 func parseBuildingGLBWithMetadata(path string) (parsedBuildingGLB, buildingRegionMetadata, error) {
@@ -1054,8 +1042,8 @@ func advanceBuildingRegionUpload(upload *buildingRegionUpload) (bool, error) {
 			texture := rl.LoadTextureFromImage(imageData)
 			if texture.ID != 0 {
 				rl.GenTextureMipmaps(&texture)
-				rl.SetTextureFilter(texture, rl.FilterTrilinear)
-				rl.SetTextureWrap(texture, rl.WrapClamp)
+				rl.SetTextureFilter(texture, rl.FilterAnisotropic16x)
+				rl.SetTextureWrap(texture, rl.WrapRepeat)
 				rl.SetMaterialTexture(&rlMaterial, rl.MapAlbedo, texture)
 				upload.Model.Textures = append(upload.Model.Textures, texture)
 			}
@@ -1106,20 +1094,6 @@ func advanceBuildingRegionUpload(upload *buildingRegionUpload) (bool, error) {
 
 func uploadDone(upload *buildingRegionUpload) bool {
 	return upload.NextMaterial >= len(upload.Data.Materials) && upload.NextMesh >= len(upload.Data.Meshes)
-}
-
-func uploadParsedBuildingGLB(data parsedBuildingGLB) (streamedBuildingModel, error) {
-	upload := newBuildingRegionUpload(data)
-	for {
-		done, err := advanceBuildingRegionUpload(upload)
-		if err != nil {
-			unloadStreamedBuildingModel(upload.Model)
-			return streamedBuildingModel{}, err
-		}
-		if done {
-			return upload.Model, nil
-		}
-	}
 }
 
 func drawStreamedBuildingModel(model streamedBuildingModel, position rl.Vector3) {

@@ -31,7 +31,7 @@ const (
 	pedHeight     = 1.75
 	pedWidth      = 0.5
 
-	terrainMeshMaxDim    = 512
+	terrainMeshMaxDim    = 2048
 	terrainTextureMaxDim = 8192
 )
 
@@ -57,7 +57,6 @@ type loaderPhase int
 const (
 	loaderPhaseCPU loaderPhase = iota
 	loaderPhaseTerrain
-	loaderPhaseBuildings
 	loaderPhaseTrees
 	loaderPhaseDone
 )
@@ -72,14 +71,10 @@ type mapLoader struct {
 	terrain *terrainCPUData
 	scene   *sceneCPUData
 
-	phase         loaderPhase
-	terrainData   *terrainData
-	regions       []buildingRegion
-	buildingCount int
-	regionIdx     int
-	regionUpload  *buildingRegionUpload
-	foliage       treeFoliageResources
-	problems      []error
+	phase       loaderPhase
+	terrainData *terrainData
+	foliage     treeFoliageResources
+	problems    []error
 }
 
 func (l *mapLoader) setStatus(s string) {
@@ -100,19 +95,9 @@ func (l *mapLoader) progress() (float32, string) {
 	}
 	switch l.phase {
 	case loaderPhaseCPU:
-		return 0.05, l.getStatus()
+		return 0.10, l.getStatus()
 	case loaderPhaseTerrain:
-		return 0.30, "uploading terrain"
-	case loaderPhaseBuildings:
-		total := 0
-		if l.scene != nil {
-			total = len(l.scene.ParsedRegions)
-		}
-		frac := float32(0)
-		if total > 0 {
-			frac = float32(l.regionIdx) / float32(total)
-		}
-		return 0.35 + 0.55*frac, fmt.Sprintf("uploading buildings %d / %d", l.regionIdx, total)
+		return 0.65, "uploading terrain"
 	case loaderPhaseTrees:
 		return 0.92, "uploading trees"
 	default:
@@ -230,6 +215,7 @@ func (a *App) update() {
 	}
 
 	pumpTerrainStreaming(a.terrain, a.camPos.X, a.camPos.Z)
+	pumpBuildingStreaming(a.objects, a.camPos.X, a.camPos.Z)
 }
 
 // ---------- draw ----------
@@ -566,15 +552,19 @@ func (a *App) drawHUD() {
 	if a.loaded {
 		buildings := 0
 		totalRegions := 0
+		residentRegions := 0
+		inFlightRegions := 0
 		trees := 0
 		if a.objects != nil {
 			buildings = a.objects.BuildingCount
 			totalRegions = len(a.objects.BuildingRegions)
+			residentRegions, inFlightRegions = residentBuildingRegions(a.objects)
 			trees = len(a.objects.Trees)
 		}
-		info := fmt.Sprintf("Cars: %d  Splines: %d  Peds: %d  Buildings: %d  GLB: %d  Trees: %d  Pos: (%.1f, %.1f, %.1f)",
+		info := fmt.Sprintf("Cars: %d  Splines: %d  Peds: %d  Buildings: %d  GLB: %d/%d (+%d streaming)  Trees: %d  Pos: (%.1f, %.1f, %.1f)",
 			len(a.world.Cars), len(a.world.Splines), len(a.world.Pedestrians),
-			buildings, totalRegions, trees, a.camPos.X, a.camPos.Y, a.camPos.Z)
+			buildings, residentRegions, totalRegions, inFlightRegions, trees,
+			a.camPos.X, a.camPos.Y, a.camPos.Z)
 		rl.DrawText(info, 8, 8, 16, rl.White)
 	}
 
@@ -778,39 +768,7 @@ func (a *App) advanceLoader() {
 			return
 		}
 		l.terrainData = td
-		l.phase = loaderPhaseBuildings
-
-	case loaderPhaseBuildings:
-		if l.regionIdx >= len(l.scene.ParsedRegions) {
-			l.phase = loaderPhaseTrees
-			return
-		}
-		region := &l.scene.ParsedRegions[l.regionIdx]
-		if l.regionUpload == nil {
-			l.regionUpload = newBuildingRegionUpload(region.Data)
-		}
-		// Advance several upload steps per frame to keep loading snappy.
-		for step := 0; step < 8; step++ {
-			done, err := advanceBuildingRegionUpload(l.regionUpload)
-			if err != nil {
-				l.problems = append(l.problems, fmt.Errorf("%s: %w", filepath.Base(region.Path), err))
-				l.regionUpload = nil
-				l.regionIdx++
-				return
-			}
-			if done {
-				l.regions = append(l.regions, buildingRegion{
-					Path:          region.Path,
-					Position:      region.Position,
-					Model:         l.regionUpload.Model,
-					BuildingCount: region.BuildingCount,
-				})
-				l.buildingCount += region.BuildingCount
-				l.regionUpload = nil
-				l.regionIdx++
-				return
-			}
-		}
+		l.phase = loaderPhaseTrees
 
 	case loaderPhaseTrees:
 		if len(l.scene.Trees) > 0 && l.scene.FoliageAtlas != nil {
@@ -827,9 +785,13 @@ func (a *App) installLoadedMap() {
 		return
 	}
 
+	totalBuildings := 0
+	for i := range l.scene.Regions {
+		totalBuildings += l.scene.Regions[i].BuildingCount
+	}
 	objects := &sceneObjects{
-		BuildingRegions: l.regions,
-		BuildingCount:   l.buildingCount,
+		BuildingRegions: l.scene.Regions,
+		BuildingCount:   totalBuildings,
 		Trees:           l.scene.Trees,
 		TreeFoliage:     l.foliage,
 	}
@@ -866,6 +828,7 @@ func (a *App) installLoadedMap() {
 	a.loader = nil
 
 	startTerrainStreaming(a.terrain)
+	startBuildingStreaming(a.objects, a.camPos.X, a.camPos.Z)
 }
 
 func (a *App) sim2world(v simpkg.Vec2) rl.Vector3 {
