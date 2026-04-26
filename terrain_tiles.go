@@ -11,14 +11,14 @@ import (
 )
 
 const (
-	terrainTileGridN           = 32
-	terrainTileHighResDim      = 512
-	terrainTileUltraResDim     = 1024
-	terrainTileExtremeResDim   = 2048
+	terrainTileGridN           = 64
+	terrainTileHighResDim      = 1024
+	terrainTileUltraResDim     = 2048
+	terrainTileExtremeResDim   = 4096
 	terrainTileExtremeNearestN = 4
-	terrainTileUltraNearestN   = 20
-	terrainTileHighNearestN    = 80 // tiles ranked beyond this drop back to base
-	terrainTileUploadsPerFrame = 2
+	terrainTileUltraNearestN   = 24
+	terrainTileHighNearestN    = 96 // tiles ranked beyond this drop back to base
+	terrainTileUploadsPerFrame = 3
 )
 
 // Tile quality tiers, in increasing detail:
@@ -250,7 +250,7 @@ func startTerrainStreaming(t *terrainData) {
 			case tileQualityExtreme:
 				dim = terrainTileExtremeResDim
 			}
-			rgba, _, _, err := buildOrthoMosaic(t.sourceTiles, tile.worldWest, tile.worldEast, tile.worldSouth, tile.worldNorth, dim)
+			rgba, _, _, err := buildOrthoMosaic(t.orthoTiles, tile.worldWest, tile.worldEast, tile.worldSouth, tile.worldNorth, dim)
 			select {
 			case <-s.quit:
 				return

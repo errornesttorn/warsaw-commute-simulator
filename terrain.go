@@ -35,7 +35,7 @@ type cropRect struct {
 type terrainData struct {
 	tiles         []*terrainTile
 	streaming     *terrainStreaming
-	sourceTiles   []terrainTileSource
+	orthoTiles    []orthoTileSource
 	heightSamples []float64
 	position      rl.Vector3
 	centerWorldX  float64
@@ -100,7 +100,7 @@ func prepareTerrainCPU(mapDef *mapDefinition, meshMaxDim, textureMaxDim int) (*t
 	}
 
 	textureRGBA, textureW, textureH, err := buildOrthoMosaic(
-		source.tiles,
+		source.orthoTiles,
 		source.worldWest,
 		source.worldEast,
 		source.worldSouth,
@@ -137,7 +137,7 @@ func finishTerrainGPU(cpu *terrainCPUData) (*terrainData, error) {
 
 	source := cpu.source
 	t := &terrainData{
-		sourceTiles:   source.tiles,
+		orthoTiles:    source.orthoTiles,
 		heightSamples: source.heights,
 		position: rl.NewVector3(
 			float32(source.worldWest-source.centerX),

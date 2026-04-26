@@ -222,7 +222,7 @@ func (a *App) update() {
 
 func (a *App) draw() {
 	rl.BeginDrawing()
-	rl.ClearBackground(rl.NewColor(30, 30, 40, 255))
+	rl.ClearBackground(rl.NewColor(170, 208, 253, 255))
 
 	if a.loader != nil {
 		a.drawLoadingScreen()

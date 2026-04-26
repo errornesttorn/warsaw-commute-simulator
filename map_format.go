@@ -8,11 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"image/color"
 	"image/draw"
 	"image/png"
 	"io"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -24,9 +26,13 @@ type mapManifest struct {
 	Name         string             `json:"name"`
 	Simulation   string             `json:"simulation,omitempty"`
 	RaylibCenter *mapManifestCenter `json:"raylib_center,omitempty"`
-	Tiles        []mapManifestTile  `json:"tiles"`
-	BuildingGLBs []string           `json:"building_glbs,omitempty"`
-	TreeFiles    []string           `json:"tree_files,omitempty"`
+	// Tiles is the legacy paired DEM+ortho format. Still accepted but new
+	// maps should prefer the independent Dems/Orthos glob lists.
+	Tiles        []mapManifestTile `json:"tiles,omitempty"`
+	Dems         []string          `json:"dems,omitempty"`
+	Orthos       []string          `json:"orthos,omitempty"`
+	BuildingGLBs []string          `json:"building_glbs,omitempty"`
+	TreeFiles    []string          `json:"tree_files,omitempty"`
 }
 
 type mapManifestTile struct {
@@ -44,7 +50,8 @@ type mapDefinition struct {
 	ManifestPath     string
 	Name             string
 	Simulation       string
-	Tiles            []terrainTileSource
+	DEMTiles         []demTileSource
+	OrthoTiles       []orthoTileSource
 	BuildingGLBPaths []string
 	TreePaths        []string
 	RaylibCenterX    float64
@@ -53,17 +60,25 @@ type mapDefinition struct {
 	HasRaylibCenterZ bool
 }
 
-type terrainTileSource struct {
-	DEMPath   string
-	OrthoPath string
-	West      float64
-	East      float64
-	South     float64
-	North     float64
+type demTileSource struct {
+	Path  string
+	West  float64
+	East  float64
+	South float64
+	North float64
+}
+
+type orthoTileSource struct {
+	Path  string
+	West  float64
+	East  float64
+	South float64
+	North float64
 }
 
 type preparedTerrainSource struct {
-	tiles      []terrainTileSource
+	demTiles   []demTileSource
+	orthoTiles []orthoTileSource
 	heights    []float64
 	valid      []bool
 	crop       cropRect
@@ -104,31 +119,53 @@ func loadMapDefinition(mapPath string) (*mapDefinition, error) {
 	if manifest.Version != 1 {
 		return nil, fmt.Errorf("unsupported map manifest version %d", manifest.Version)
 	}
-	if len(manifest.Tiles) == 0 {
-		return nil, errors.New("map manifest contains no tiles")
+	baseDir := filepath.Dir(manifestPath)
+
+	// Combine the legacy paired Tiles list with the new independent
+	// Dems/Orthos glob lists. The DEM/ortho coverage need not match.
+	demEntries := append([]string(nil), manifest.Dems...)
+	orthoEntries := append([]string(nil), manifest.Orthos...)
+	for _, tile := range manifest.Tiles {
+		if tile.DEM != "" {
+			demEntries = append(demEntries, tile.DEM)
+		}
+		if tile.Ortho != "" {
+			orthoEntries = append(orthoEntries, tile.Ortho)
+		}
 	}
 
-	baseDir := filepath.Dir(manifestPath)
-	tiles := make([]terrainTileSource, 0, len(manifest.Tiles))
-	for i, tile := range manifest.Tiles {
-		if tile.DEM == "" || tile.Ortho == "" {
-			return nil, fmt.Errorf("map tile %d is missing dem or ortho path", i)
-		}
+	demPaths, err := resolveMapFilePatterns(baseDir, demEntries)
+	if err != nil {
+		return nil, fmt.Errorf("resolve DEM files: %w", err)
+	}
+	if len(demPaths) == 0 {
+		return nil, errors.New("map manifest contains no DEM (.asc) files")
+	}
+	orthoPaths, err := resolveMapFilePatterns(baseDir, orthoEntries)
+	if err != nil {
+		return nil, fmt.Errorf("resolve ortho files: %w", err)
+	}
 
-		demPath := filepath.Clean(filepath.Join(baseDir, tile.DEM))
-		orthoPath := filepath.Clean(filepath.Join(baseDir, tile.Ortho))
+	demTiles := make([]demTileSource, 0, len(demPaths))
+	for _, demPath := range demPaths {
 		meta, err := readDEMMetadata(demPath)
 		if err != nil {
-			return nil, fmt.Errorf("read DEM metadata for tile %d: %w", i, err)
+			return nil, fmt.Errorf("read DEM metadata for %s: %w", filepath.Base(demPath), err)
 		}
 		west, east, south, north := demWorldBounds(meta)
-		tiles = append(tiles, terrainTileSource{
-			DEMPath:   demPath,
-			OrthoPath: orthoPath,
-			West:      west,
-			East:      east,
-			South:     south,
-			North:     north,
+		demTiles = append(demTiles, demTileSource{
+			Path: demPath, West: west, East: east, South: south, North: north,
+		})
+	}
+
+	orthoTiles := make([]orthoTileSource, 0, len(orthoPaths))
+	for _, orthoPath := range orthoPaths {
+		west, east, south, north, err := readOrthoBounds(orthoPath)
+		if err != nil {
+			return nil, fmt.Errorf("read ortho bounds for %s: %w", filepath.Base(orthoPath), err)
+		}
+		orthoTiles = append(orthoTiles, orthoTileSource{
+			Path: orthoPath, West: west, East: east, South: south, North: north,
 		})
 	}
 
@@ -140,7 +177,8 @@ func loadMapDefinition(mapPath string) (*mapDefinition, error) {
 		ManifestPath: manifestPath,
 		Name:         name,
 		Simulation:   manifest.Simulation,
-		Tiles:        tiles,
+		DEMTiles:     demTiles,
+		OrthoTiles:   orthoTiles,
 	}
 	buildingGLBPaths, err := resolveMapFilePatterns(baseDir, manifest.BuildingGLBs)
 	if err != nil {
@@ -210,23 +248,26 @@ func hasGlobMeta(path string) bool {
 }
 
 func prepareTerrainSource(mapDef *mapDefinition, meshMaxDim int) (*preparedTerrainSource, error) {
-	if mapDef == nil || len(mapDef.Tiles) == 0 {
-		return nil, errors.New("map contains no terrain tiles")
+	if mapDef == nil || len(mapDef.DEMTiles) == 0 {
+		return nil, errors.New("map contains no DEM tiles")
 	}
 
+	// World extent is driven by the DEMs only — ortho-only areas have no
+	// surface to texture. Orthos that fall outside this extent are simply
+	// ignored when building the mosaic.
 	unionWest := math.MaxFloat64
 	unionSouth := math.MaxFloat64
 	unionEast := -math.MaxFloat64
 	unionNorth := -math.MaxFloat64
 
-	for _, tile := range mapDef.Tiles {
+	for _, tile := range mapDef.DEMTiles {
 		unionWest = math.Min(unionWest, tile.West)
 		unionSouth = math.Min(unionSouth, tile.South)
 		unionEast = math.Max(unionEast, tile.East)
 		unionNorth = math.Max(unionNorth, tile.North)
 	}
 	if unionEast <= unionWest || unionNorth <= unionSouth {
-		return nil, errors.New("map tiles do not define a valid world extent")
+		return nil, errors.New("map DEMs do not define a valid world extent")
 	}
 
 	targetW, targetH := fitDimensionsBySpan(unionEast-unionWest, unionNorth-unionSouth, meshMaxDim)
@@ -242,12 +283,12 @@ func prepareTerrainSource(mapDef *mapDefinition, meshMaxDim int) (*preparedTerra
 	counts := make([]int, targetW*targetH)
 	valid := make([]bool, targetW*targetH)
 
-	for _, tile := range mapDef.Tiles {
-		meta, err := readDEMMetadata(tile.DEMPath)
+	for _, tile := range mapDef.DEMTiles {
+		meta, err := readDEMMetadata(tile.Path)
 		if err != nil {
 			return nil, err
 		}
-		if err := accumulateDEMIntoGrid(tile.DEMPath, meta, unionWest, unionEast, unionSouth, unionNorth, targetW, targetH, sums, counts, valid); err != nil {
+		if err := accumulateDEMIntoGrid(tile.Path, meta, unionWest, unionEast, unionSouth, unionNorth, targetW, targetH, sums, counts, valid); err != nil {
 			return nil, err
 		}
 	}
@@ -295,7 +336,8 @@ func finishPreparedTerrainSource(mapDef *mapDefinition, sums []float64, counts [
 	worldSouth := unionNorth - (float64(crop.maxY)/float64(targetH-1))*heightSpan
 
 	return &preparedTerrainSource{
-		tiles:      mapDef.Tiles,
+		demTiles:   mapDef.DEMTiles,
+		orthoTiles: mapDef.OrthoTiles,
 		heights:    heights,
 		valid:      croppedValid,
 		crop:       cropRect{minX: 0, minY: 0, maxX: cropW - 1, maxY: cropH - 1},
@@ -476,9 +518,15 @@ func accumulateDEMIntoGrid(path string, meta demMetadata, worldWest, worldEast, 
 	return scanner.Err()
 }
 
-func buildOrthoMosaic(tiles []terrainTileSource, worldWest, worldEast, worldSouth, worldNorth float64, textureMaxDim int) (*image.RGBA, int, int, error) {
+// orthoFallbackColor fills any part of the terrain canvas that has no ortho
+// coverage. It picks a neutral grey-green so DEM-only regions render as flat
+// terrain rather than transparent black through raylib's default shader.
+var orthoFallbackColor = color.RGBA{R: 90, G: 100, B: 86, A: 255}
+
+func buildOrthoMosaic(tiles []orthoTileSource, worldWest, worldEast, worldSouth, worldNorth float64, textureMaxDim int) (*image.RGBA, int, int, error) {
 	textureW, textureH := fitDimensionsBySpan(worldEast-worldWest, worldNorth-worldSouth, textureMaxDim)
 	canvas := image.NewRGBA(image.Rect(0, 0, textureW, textureH))
+	draw.Draw(canvas, canvas.Bounds(), &image.Uniform{C: orthoFallbackColor}, image.Point{}, draw.Src)
 
 	for _, tile := range tiles {
 		interWest := math.Max(worldWest, tile.West)
@@ -494,7 +542,7 @@ func buildOrthoMosaic(tiles []terrainTileSource, worldWest, worldEast, worldSout
 			continue
 		}
 
-		img, err := loadOrthophotoImageExact(tile.OrthoPath, interWest, interEast, interSouth, interNorth, dst.Dx(), dst.Dy())
+		img, err := loadOrthophotoImageExact(tile.Path, interWest, interEast, interSouth, interNorth, dst.Dx(), dst.Dy())
 		if err != nil {
 			return nil, 0, 0, err
 		}
@@ -555,7 +603,7 @@ type terrainGridCacheData struct {
 const terrainGridCacheMagic uint32 = 0x44454d31 // "DEM1"
 
 func terrainGridCachePath(mapDef *mapDefinition, meshMaxDim, targetW, targetH int, west, east, south, north float64) (string, error) {
-	if mapDef == nil || len(mapDef.Tiles) == 0 {
+	if mapDef == nil || len(mapDef.DEMTiles) == 0 {
 		return "", errors.New("no map")
 	}
 	baseDir := filepath.Dir(mapDef.ManifestPath)
@@ -565,13 +613,13 @@ func terrainGridCachePath(mapDef *mapDefinition, meshMaxDim, targetW, targetH in
 	}
 
 	h := sha1.New()
-	fmt.Fprintf(h, "v1|%d|%d|%d|%.6f|%.6f|%.6f|%.6f", meshMaxDim, targetW, targetH, west, east, south, north)
-	for _, tile := range mapDef.Tiles {
-		info, err := os.Stat(tile.DEMPath)
+	fmt.Fprintf(h, "v2|%d|%d|%d|%.6f|%.6f|%.6f|%.6f", meshMaxDim, targetW, targetH, west, east, south, north)
+	for _, tile := range mapDef.DEMTiles {
+		info, err := os.Stat(tile.Path)
 		if err != nil {
 			return "", err
 		}
-		fmt.Fprintf(h, "|%s|%d|%d", filepath.Base(tile.DEMPath), info.Size(), info.ModTime().UnixNano())
+		fmt.Fprintf(h, "|%s|%d|%d", filepath.Base(tile.Path), info.Size(), info.ModTime().UnixNano())
 	}
 	return filepath.Join(cacheDir, fmt.Sprintf("dem-grid-%x.bin", h.Sum(nil))), nil
 }
@@ -670,6 +718,39 @@ func saveTerrainGridCache(path string, sums []float64, counts []int, valid []boo
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+// readOrthoBounds returns the projected world bounds of a GeoTIFF orthophoto
+// by parsing `gdalinfo -json`. We rely on gdal already being a hard dependency
+// (used elsewhere for orthophoto downsampling) rather than implementing
+// GeoTIFF tag parsing inline. Assumes a north-up georeference, which is the
+// case for every dataset produced by the standard Polish geoportal exports
+// this game targets.
+func readOrthoBounds(path string) (west, east, south, north float64, err error) {
+	if _, lookErr := exec.LookPath("gdalinfo"); lookErr != nil {
+		return 0, 0, 0, 0, errors.New("gdalinfo is required to read orthophoto bounds")
+	}
+	out, runErr := exec.Command("gdalinfo", "-json", path).Output()
+	if runErr != nil {
+		return 0, 0, 0, 0, fmt.Errorf("gdalinfo failed: %w", runErr)
+	}
+	var info struct {
+		CornerCoordinates struct {
+			UpperLeft  [2]float64 `json:"upperLeft"`
+			LowerRight [2]float64 `json:"lowerRight"`
+		} `json:"cornerCoordinates"`
+	}
+	if err := json.Unmarshal(out, &info); err != nil {
+		return 0, 0, 0, 0, fmt.Errorf("parse gdalinfo output: %w", err)
+	}
+	west = info.CornerCoordinates.UpperLeft[0]
+	north = info.CornerCoordinates.UpperLeft[1]
+	east = info.CornerCoordinates.LowerRight[0]
+	south = info.CornerCoordinates.LowerRight[1]
+	if east <= west || north <= south {
+		return 0, 0, 0, 0, fmt.Errorf("invalid georeference (corners %.3f,%.3f .. %.3f,%.3f)", west, north, east, south)
+	}
+	return west, east, south, north, nil
 }
 
 func clampInt(v, lo, hi int) int {
