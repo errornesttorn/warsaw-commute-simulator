@@ -33,6 +33,7 @@ type mapManifest struct {
 	Orthos       []string          `json:"orthos,omitempty"`
 	BuildingGLBs []string          `json:"building_glbs,omitempty"`
 	TreeFiles    []string          `json:"tree_files,omitempty"`
+	ShrubMasks   []string          `json:"shrub_masks,omitempty"`
 }
 
 type mapManifestTile struct {
@@ -54,6 +55,7 @@ type mapDefinition struct {
 	OrthoTiles       []orthoTileSource
 	BuildingGLBPaths []string
 	TreePaths        []string
+	ShrubMaskPaths   []string
 	RaylibCenterX    float64
 	RaylibCenterY    float64
 	RaylibCenterZ    float64
@@ -190,6 +192,13 @@ func loadMapDefinition(mapPath string) (*mapDefinition, error) {
 		return nil, fmt.Errorf("resolve tree files: %w", err)
 	}
 	mapDef.TreePaths = treePaths
+
+	shrubMaskPaths, err := resolveMapFilePatterns(baseDir, manifest.ShrubMasks)
+	if err != nil {
+		return nil, fmt.Errorf("resolve shrub mask files: %w", err)
+	}
+	mapDef.ShrubMaskPaths = shrubMaskPaths
+
 	if manifest.RaylibCenter != nil {
 		mapDef.RaylibCenterX = manifest.RaylibCenter.X
 		mapDef.RaylibCenterY = manifest.RaylibCenter.Y

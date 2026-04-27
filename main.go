@@ -231,6 +231,7 @@ func (a *App) draw() {
 	}
 
 	camera := a.buildCamera()
+	rl.SetClipPlanes(0.01, 2000.0)
 	rl.BeginMode3D(camera)
 	if a.terrain != nil {
 		drawTerrainTiles(a.terrain)

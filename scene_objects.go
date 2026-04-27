@@ -9,10 +9,12 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"image/png"
 	"io"
 	"math"
 	"math/rand"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -89,6 +91,7 @@ type treeInstance struct {
 	Height      float32
 	TrunkRadius float32
 	CrownRadius float32
+	IsShrub     bool
 }
 
 type visibleTreeDraw struct {
@@ -134,6 +137,19 @@ func prepareSceneCPU(mapDef *mapDefinition, terrain *terrainData, progress func(
 		}
 		out.Trees = append(out.Trees, trees...)
 	}
+
+	if progress != nil {
+		progress("loading shrubs")
+	}
+	for _, path := range mapDef.ShrubMaskPaths {
+		shrubs, err := loadShrubInstances(path, terrain)
+		if err != nil {
+			out.Problems = append(out.Problems, fmt.Errorf("%s: %w", filepath.Base(path), err))
+			continue
+		}
+		out.Trees = append(out.Trees, shrubs...)
+	}
+
 	if len(out.Trees) > 0 {
 		if progress != nil {
 			progress("generating foliage")
@@ -211,7 +227,7 @@ func drawTreeTrunks(visibleTrees []visibleTreeDraw) {
 		style := treeRenderStyleFor(tree)
 
 		trunkHeight := tree.Height * style.LogRatio
-		if trunkHeight < 1.4 {
+		if !tree.IsShrub && trunkHeight < 1.4 {
 			trunkHeight = 1.4
 		}
 
@@ -454,12 +470,12 @@ func buildTreeFoliageMesh(trees []treeInstance, variantCount int) rl.Mesh {
 	for _, tree := range trees {
 		style := treeRenderStyleFor(tree)
 		trunkHeight := tree.Height * style.LogRatio
-		if trunkHeight < 1.4 {
+		if !tree.IsShrub && trunkHeight < 1.4 {
 			trunkHeight = 1.4
 		}
 
 		crownHeight := tree.Height * 0.78 * style.HeightScale
-		if crownHeight < 2.2 {
+		if !tree.IsShrub && crownHeight < 2.2 {
 			crownHeight = 2.2
 		}
 		crownWidth := max32(tree.CrownRadius*2.9, tree.Height*0.48) * style.WidthScale
@@ -537,11 +553,28 @@ func appendFoliageVertex(vertices, texcoords *[]float32, colors *[]uint8, positi
 
 func treeRenderStyleFor(tree treeInstance) treeRenderStyle {
 	seed := treeSeed(tree)
+	if tree.IsShrub {
+		return treeRenderStyle{
+			Variant:     int(seed % 10),
+			WidthScale:  0.8 + seededUnit(seed, 5)*0.6,
+			HeightScale: 0.5 + seededUnit(seed, 9)*1.0,           // Semi-randomised height scale
+			LogRatio:    0.0 + float32(seededUnit(seed, 45)*0.18), // Semi-randomised leaf-to-log ratio (still low)
+			Tint: rl.NewColor(
+				uint8(180+seededUnit(seed, 13)*30),
+				uint8(200+seededUnit(seed, 17)*30),
+				uint8(150+seededUnit(seed, 21)*40),
+				uint8(210+seededUnit(seed, 25)*34),
+			),
+			OffsetX: (seededUnit(seed, 33) - 0.5) * tree.CrownRadius * 0.5,
+			OffsetZ: (seededUnit(seed, 37) - 0.5) * tree.CrownRadius * 0.5,
+		}
+	}
+
 	return treeRenderStyle{
 		Variant:     int(seed % 10),
-		WidthScale:  0.9 + seededUnit(seed, 5)*0.28,
-		HeightScale: 0.92 + seededUnit(seed, 9)*0.2,
-		LogRatio:    0.30 + float32(seededUnit(seed, 45)*0.20),
+		WidthScale:  1.3 + seededUnit(seed, 5)*0.4,
+		HeightScale: 1.35 + seededUnit(seed, 9)*0.3,
+		LogRatio:    0.15 + float32(seededUnit(seed, 45)*0.10),
 		Tint: rl.NewColor(
 			uint8(226+seededUnit(seed, 13)*24),
 			uint8(232+seededUnit(seed, 17)*20),
@@ -1290,4 +1323,119 @@ func clampFloat64(value, minValue, maxValue float64) float64 {
 func treeCrownColor(tree treeInstance) rl.Color {
 	seed := int(math.Abs(float64(tree.X*0.37+tree.Z*0.19))) % 24
 	return rl.NewColor(uint8(42+seed/2), uint8(105+seed), uint8(50+seed/3), 255)
+}
+
+func ensureShrubMaskCache(shrubPath string) (string, error) {
+	if _, err := exec.LookPath("gdal_translate"); err != nil {
+		return "", errors.New("gdal_translate is required to process shrub masks")
+	}
+
+	cacheDir := filepath.Join(filepath.Dir(shrubPath), ".terrain-cache")
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		return "", fmt.Errorf("create cache directory: %w", err)
+	}
+
+	baseName := strings.TrimSuffix(filepath.Base(shrubPath), filepath.Ext(shrubPath))
+	cachePath := filepath.Join(cacheDir, fmt.Sprintf("%s.png", baseName))
+
+	srcInfo, err := os.Stat(shrubPath)
+	if err != nil {
+		return "", err
+	}
+	cacheInfo, err := os.Stat(cachePath)
+	if err == nil && !cacheInfo.ModTime().Before(srcInfo.ModTime()) {
+		return cachePath, nil
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+
+	cmd := exec.Command(
+		"gdal_translate",
+		"-q",
+		"-of", "PNG",
+		shrubPath,
+		cachePath,
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("gdal_translate failed: %w\n%s", err, strings.TrimSpace(string(output)))
+	}
+
+	return cachePath, nil
+}
+
+func loadShrubInstances(shrubPath string, terrain *terrainData) ([]treeInstance, error) {
+	west, east, south, north, err := readOrthoBounds(shrubPath)
+	if err != nil {
+		return nil, fmt.Errorf("read mask bounds: %w", err)
+	}
+
+	pngPath, err := ensureShrubMaskCache(shrubPath)
+	if err != nil {
+		return nil, fmt.Errorf("mask cache: %w", err)
+	}
+
+	file, err := os.Open(pngPath)
+	if err != nil {
+		return nil, fmt.Errorf("open mask png: %w", err)
+	}
+	defer file.Close()
+
+	img, err := png.Decode(file)
+	if err != nil {
+		return nil, fmt.Errorf("decode mask png: %w", err)
+	}
+
+	bounds := img.Bounds()
+	width := bounds.Dx()
+	height := bounds.Dy()
+	if width == 0 || height == 0 {
+		return nil, nil
+	}
+
+	var shrubs []treeInstance
+
+	// Determine density: e.g. 1 shrub roughly every 8 sq meters
+	// Reduced by 4x from previous 0.03
+	prob := 0.0075
+
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		worldY := north - (float64(y-bounds.Min.Y)/float64(height))*(north-south)
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			r, g, b, a := img.At(x, y).RGBA()
+			if a > 0 && !(r == 65535 && g == 65535 && b == 65535) {
+				// Seed deterministic RNG based on coordinate so it's consistent
+				seed := uint64(x)*uint64(width) + uint64(y)*uint64(height)
+				rngVal := mixUint32(uint32(seed) ^ 0x9e3779b1)
+
+				if float64(rngVal)/float64(math.MaxUint32) < prob {
+					worldX := west + (float64(x-bounds.Min.X)/float64(width))*(east-west)
+					localX, localZ := terrainLocalXZ(terrain, worldX, worldY)
+					baseY := terrainHeightAtLocal(terrain, localX, localZ)
+
+					// Shrub random properties
+					hVal := float32(mixUint32(rngVal^0x85ebca6b)) / float32(math.MaxUint32)
+					crVal := float32(mixUint32(rngVal^0xc2b2ae35)) / float32(math.MaxUint32)
+
+					// Max height increased to 10.35m (50% taller than 6.9m), min height 2m
+					h := 2.0 + hVal*8.35
+					cr := h * (0.15 + crVal*0.2) // narrower crowns for shrubs
+					tr := cr * 0.1
+
+					shrubs = append(shrubs, treeInstance{
+						X:           localX,
+						Z:           localZ,
+						BaseY:       baseY,
+						Height:      h,
+						CrownRadius: cr,
+						TrunkRadius: tr,
+						IsShrub:     true,
+					})
+				}
+			}
+		}
+	}
+
+	return shrubs, nil
 }
