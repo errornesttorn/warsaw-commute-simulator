@@ -42,6 +42,12 @@ type buildingRegion struct {
 	BoundsMinX, BoundsMaxX float32
 	BoundsMinZ, BoundsMaxZ float32
 	HasBounds              bool
+
+	// Texture quality tier currently on the GPU (buildingQualityNone/Low/Full).
+	Quality int
+	// Upgrading is true while a full-quality re-parse is in flight for this
+	// region; the low-quality model continues to render during that window.
+	Upgrading bool
 }
 
 // regionDistSquared returns the squared horizontal distance from (cx,cz) to
@@ -102,10 +108,11 @@ type streamedBuildingModel struct {
 }
 
 type buildingRegionUpload struct {
-	Data         parsedBuildingGLB
-	Model        streamedBuildingModel
-	NextMaterial int
-	NextMesh     int
+	Data          parsedBuildingGLB
+	Model         streamedBuildingModel
+	NextMaterial  int
+	NextMesh      int
+	TargetQuality int // quality tier this upload will deliver
 }
 
 type treeFoliageResources struct {
@@ -797,7 +804,7 @@ func parseBuildingGLBMetadataOnly(path string) (buildingRegionMetadata, error) {
 	return meta, nil
 }
 
-func parseBuildingGLBWithMetadata(path string) (parsedBuildingGLB, buildingRegionMetadata, error) {
+func parseBuildingGLBWithMetadata(path string, maxTextureDim int) (parsedBuildingGLB, buildingRegionMetadata, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return parsedBuildingGLB{}, buildingRegionMetadata{}, fmt.Errorf("read GLB: %w", err)
@@ -815,16 +822,16 @@ func parseBuildingGLBWithMetadata(path string) (parsedBuildingGLB, buildingRegio
 		Buildings:      doc.Extras.Stats.Buildings,
 	}
 
-	parsed, err := buildParsedGLB(doc, bin)
+	parsed, err := buildParsedGLB(doc, bin, maxTextureDim)
 	if err != nil {
 		return parsedBuildingGLB{}, buildingRegionMetadata{}, err
 	}
 	return parsed, metadata, nil
 }
 
-func buildParsedGLB(doc buildingGLBDocument, bin []byte) (parsedBuildingGLB, error) {
+func buildParsedGLB(doc buildingGLBDocument, bin []byte, maxTextureDim int) (parsedBuildingGLB, error) {
 
-	materials, err := parseBuildingMaterials(doc, bin)
+	materials, err := parseBuildingMaterials(doc, bin, maxTextureDim)
 	if err != nil {
 		return parsedBuildingGLB{}, err
 	}
@@ -982,7 +989,48 @@ func parseGLBChunks(raw []byte) (buildingGLBDocument, []byte, error) {
 	return doc, raw[offset : offset+binLength], nil
 }
 
-func parseBuildingMaterials(doc buildingGLBDocument, bin []byte) ([]parsedBuildingMaterial, error) {
+// downscaleImageNearest scales src to fit within maxDim×maxDim using nearest-
+// neighbour sampling. Returns src unchanged when no downscaling is needed.
+// Output is always *image.NRGBA with straight alpha.
+func downscaleImageNearest(src image.Image, maxDim int) image.Image {
+	b := src.Bounds()
+	srcW, srcH := b.Dx(), b.Dy()
+	if maxDim <= 0 || (srcW <= maxDim && srcH <= maxDim) {
+		return src
+	}
+	larger := srcW
+	if srcH > srcW {
+		larger = srcH
+	}
+	dstW := srcW * maxDim / larger
+	dstH := srcH * maxDim / larger
+	if dstW < 1 {
+		dstW = 1
+	}
+	if dstH < 1 {
+		dstH = 1
+	}
+	dst := image.NewNRGBA(image.Rect(0, 0, dstW, dstH))
+	for dy := 0; dy < dstH; dy++ {
+		sy := dy * srcH / dstH
+		for dx := 0; dx < dstW; dx++ {
+			sx := dx * srcW / dstW
+			// RGBA() returns premultiplied [0,65535]; convert to straight-alpha [0,255].
+			r, g, bl, a := src.At(b.Min.X+sx, b.Min.Y+sy).RGBA()
+			na := uint8(a >> 8)
+			var nr, ng, nb uint8
+			if a != 0 {
+				nr = uint8(r * 0xff / a)
+				ng = uint8(g * 0xff / a)
+				nb = uint8(bl * 0xff / a)
+			}
+			dst.SetNRGBA(dx, dy, color.NRGBA{R: nr, G: ng, B: nb, A: na})
+		}
+	}
+	return dst
+}
+
+func parseBuildingMaterials(doc buildingGLBDocument, bin []byte, maxTextureDim int) ([]parsedBuildingMaterial, error) {
 	materials := make([]parsedBuildingMaterial, len(doc.Materials))
 	for i, material := range doc.Materials {
 		materials[i].Color = rl.White
@@ -1017,7 +1065,7 @@ func parseBuildingMaterials(doc buildingGLBDocument, bin []byte) ([]parsedBuildi
 		if err != nil {
 			return nil, fmt.Errorf("decode material image: %w", err)
 		}
-		materials[i].TextureImage = img
+		materials[i].TextureImage = downscaleImageNearest(img, maxTextureDim)
 	}
 	return materials, nil
 }

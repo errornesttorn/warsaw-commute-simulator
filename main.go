@@ -555,16 +555,17 @@ func (a *App) drawHUD() {
 		totalRegions := 0
 		residentRegions := 0
 		inFlightRegions := 0
+		upgradingRegions := 0
 		trees := 0
 		if a.objects != nil {
 			buildings = a.objects.BuildingCount
 			totalRegions = len(a.objects.BuildingRegions)
-			residentRegions, inFlightRegions = residentBuildingRegions(a.objects)
+			residentRegions, inFlightRegions, upgradingRegions = residentBuildingRegions(a.objects)
 			trees = len(a.objects.Trees)
 		}
-		info := fmt.Sprintf("Cars: %d  Splines: %d  Peds: %d  Buildings: %d  GLB: %d/%d (+%d streaming)  Trees: %d  Pos: (%.1f, %.1f, %.1f)",
+		info := fmt.Sprintf("Cars: %d  Splines: %d  Peds: %d  Buildings: %d  GLB: %d/%d (+%d loading, %d upgrading)  Trees: %d  Pos: (%.1f, %.1f, %.1f)",
 			len(a.world.Cars), len(a.world.Splines), len(a.world.Pedestrians),
-			buildings, residentRegions, totalRegions, inFlightRegions, trees,
+			buildings, residentRegions, totalRegions, inFlightRegions, upgradingRegions, trees,
 			a.camPos.X, a.camPos.Y, a.camPos.Z)
 		rl.DrawText(info, 8, 8, 16, rl.White)
 	}

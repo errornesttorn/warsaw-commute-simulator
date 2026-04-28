@@ -22,6 +22,11 @@ type vramReport struct {
 	buildingMeshCount  int
 	terrainTextureMaxW int32
 	terrainTextureMinW int32
+
+	buildingLowCount  int // regions at buildingQualityLow
+	buildingMedCount  int // regions at buildingQualityMed
+	buildingFullCount int // regions at buildingQualityFull
+	buildingTexAvgW   int32
 }
 
 func textureBytes(tex rl.Texture2D) int64 {
@@ -62,15 +67,28 @@ func collectVRAM(a *App) vramReport {
 		}
 	}
 	if a.objects != nil {
+		var buildingTexWidthSum int64
 		for _, region := range a.objects.BuildingRegions {
+			switch region.Quality {
+			case buildingQualityLow:
+				r.buildingLowCount++
+			case buildingQualityMed:
+				r.buildingMedCount++
+			case buildingQualityFull:
+				r.buildingFullCount++
+			}
 			for _, tex := range region.Model.Textures {
 				r.buildingTex += textureBytes(tex)
 				r.buildingTexCount++
+				buildingTexWidthSum += int64(tex.Width)
 			}
 			for _, m := range region.Model.Meshes {
 				r.buildingMeshes += meshBytes(m)
 				r.buildingMeshCount++
 			}
+		}
+		if r.buildingTexCount > 0 {
+			r.buildingTexAvgW = int32(buildingTexWidthSum / int64(r.buildingTexCount))
 		}
 		if a.objects.TreeFoliage.Loaded {
 			r.foliageTex += textureBytes(a.objects.TreeFoliage.Texture)
@@ -129,6 +147,8 @@ func drawVRAMProfiler(a *App) {
 		"",
 		fmt.Sprintf("Buildings:                %s", formatBytes(buildingTotal)),
 		fmt.Sprintf("  textures (%d):           %s", r.buildingTexCount, formatBytes(r.buildingTex)),
+		fmt.Sprintf("  avg tex width:          %d px", r.buildingTexAvgW),
+		fmt.Sprintf("  quality low/med/full:   %d / %d / %d", r.buildingLowCount, r.buildingMedCount, r.buildingFullCount),
 		fmt.Sprintf("  meshes (%d):             %s", r.buildingMeshCount, formatBytes(r.buildingMeshes)),
 		"",
 		fmt.Sprintf("Foliage:                  %s", formatBytes(foliageTotal)),
