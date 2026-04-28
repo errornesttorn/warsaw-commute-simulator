@@ -159,9 +159,7 @@ func pickNextBuildingParseJob(objects *sceneObjects, s *buildingStreaming) int {
 		if region.State != regionStateUnloaded {
 			continue
 		}
-		dx := region.Position.X - cx
-		dz := region.Position.Z - cz
-		d2 := dx*dx + dz*dz
+		d2 := regionDistSquared(region, cx, cz)
 		if d2 > loadR2 {
 			continue
 		}
@@ -180,8 +178,10 @@ func pickNextBuildingParseJob(objects *sceneObjects, s *buildingStreaming) int {
 // pumpBuildingStreaming runs one frame of streaming on the main thread:
 //  1. Updates the worker-visible camera position.
 //  2. Evicts regions that drifted past the evict radius.
-//  3. Drains any newly parsed results into the upload pool.
-//  4. Advances up to buildingUploadStepsPerFrame upload steps.
+//  3. Pressure-evicts the farthest loaded region if the cap is full but a
+//     closer unloaded region needs a slot.
+//  4. Drains any newly parsed results into the upload pool.
+//  5. Advances up to buildingUploadStepsPerFrame upload steps.
 func pumpBuildingStreaming(objects *sceneObjects, camX, camZ float32) {
 	if objects == nil || objects.streaming == nil {
 		return
@@ -193,14 +193,14 @@ func pumpBuildingStreaming(objects *sceneObjects, camX, camZ float32) {
 	s.camMu.Unlock()
 
 	evictR2 := float32(buildingEvictRadius * buildingEvictRadius)
+	loadR2 := float32(buildingLoadRadius * buildingLoadRadius)
 
-	// Eviction pass.
 	s.mu.Lock()
+
+	// Regular eviction: remove regions that drifted past the evict radius.
 	for i := range objects.BuildingRegions {
 		region := &objects.BuildingRegions[i]
-		dx := region.Position.X - camX
-		dz := region.Position.Z - camZ
-		if dx*dx+dz*dz <= evictR2 {
+		if regionDistSquared(region, camX, camZ) <= evictR2 {
 			continue
 		}
 		switch region.State {
@@ -221,6 +221,52 @@ func pumpBuildingStreaming(objects *sceneObjects, camX, camZ float32) {
 		// Requested: let the worker finish; the result drain will discard it
 		// if the region is still beyond evict range.
 	}
+
+	// Pressure eviction: the hysteresis band [loadRadius, evictRadius] can fill
+	// all resident slots with regions the camera has already moved away from,
+	// blocking closer regions from ever loading. When the cap is full, find the
+	// nearest unloaded region within loadRadius; if any loaded region is farther
+	// away, evict the farthest one to free a slot.
+	resident := 0
+	for i := range objects.BuildingRegions {
+		if objects.BuildingRegions[i].State != regionStateUnloaded {
+			resident++
+		}
+	}
+	if resident >= buildingMaxResident {
+		nearestUnloadedD2 := float32(math.MaxFloat32)
+		for i := range objects.BuildingRegions {
+			if objects.BuildingRegions[i].State != regionStateUnloaded {
+				continue
+			}
+			d2 := regionDistSquared(&objects.BuildingRegions[i], camX, camZ)
+			if d2 <= loadR2 && d2 < nearestUnloadedD2 {
+				nearestUnloadedD2 = d2
+			}
+		}
+		if nearestUnloadedD2 < math.MaxFloat32 {
+			farthestIdx := -1
+			farthestD2 := nearestUnloadedD2 // only evict if strictly farther
+			for i := range objects.BuildingRegions {
+				region := &objects.BuildingRegions[i]
+				if region.State != regionStateLoaded {
+					continue
+				}
+				d2 := regionDistSquared(region, camX, camZ)
+				if d2 > farthestD2 {
+					farthestD2 = d2
+					farthestIdx = i
+				}
+			}
+			if farthestIdx >= 0 {
+				region := &objects.BuildingRegions[farthestIdx]
+				unloadStreamedBuildingModel(region.Model)
+				region.Model = streamedBuildingModel{}
+				region.State = regionStateUnloaded
+			}
+		}
+	}
+
 	s.mu.Unlock()
 
 	// Drain parse results.
@@ -235,9 +281,7 @@ drain:
 				s.mu.Unlock()
 				continue
 			}
-			dx := region.Position.X - camX
-			dz := region.Position.Z - camZ
-			if dx*dx+dz*dz > evictR2 {
+			if regionDistSquared(region, camX, camZ) > evictR2 {
 				region.State = regionStateUnloaded
 				s.mu.Unlock()
 				continue
@@ -288,9 +332,7 @@ func pickNextUpload(objects *sceneObjects, s *buildingStreaming) (int, *building
 	bestD2 := float32(math.MaxFloat32)
 	for idx := range s.uploads {
 		region := &objects.BuildingRegions[idx]
-		dx := region.Position.X - cx
-		dz := region.Position.Z - cz
-		d2 := dx*dx + dz*dz
+		d2 := regionDistSquared(region, cx, cz)
 		if d2 < bestD2 {
 			bestD2 = d2
 			bestIdx = idx
@@ -307,9 +349,7 @@ func pickNextUpload(objects *sceneObjects, s *buildingStreaming) (int, *building
 	cands := make([]cand, 0, len(s.parsed))
 	for idx := range s.parsed {
 		region := &objects.BuildingRegions[idx]
-		dx := region.Position.X - cx
-		dz := region.Position.Z - cz
-		cands = append(cands, cand{idx, dx*dx + dz*dz})
+		cands = append(cands, cand{idx, regionDistSquared(region, cx, cz)})
 	}
 	if len(cands) == 0 {
 		return -1, nil

@@ -36,11 +36,44 @@ type buildingRegion struct {
 	Position      rl.Vector3
 	BuildingCount int
 	State         buildingRegionState
+	// World-space horizontal AABB for distance tests. Set from POSITION accessor
+	// min/max so the distance is measured to the nearest edge, not just the
+	// origin corner. HasBounds is false if the GLB lacked accessor min/max.
+	BoundsMinX, BoundsMaxX float32
+	BoundsMinZ, BoundsMaxZ float32
+	HasBounds              bool
+}
+
+// regionDistSquared returns the squared horizontal distance from (cx,cz) to
+// the nearest point of the region's AABB, or to its origin if HasBounds is
+// false. Returns 0 when the camera is inside the region.
+func regionDistSquared(region *buildingRegion, cx, cz float32) float32 {
+	if !region.HasBounds {
+		dx := region.Position.X - cx
+		dz := region.Position.Z - cz
+		return dx*dx + dz*dz
+	}
+	var dx, dz float32
+	if cx < region.BoundsMinX {
+		dx = region.BoundsMinX - cx
+	} else if cx > region.BoundsMaxX {
+		dx = cx - region.BoundsMaxX
+	}
+	if cz < region.BoundsMinZ {
+		dz = region.BoundsMinZ - cz
+	} else if cz > region.BoundsMaxZ {
+		dz = cz - region.BoundsMaxZ
+	}
+	return dx*dx + dz*dz
 }
 
 type buildingRegionMetadata struct {
 	OriginEPSG2180 []float64 `json:"origin_epsg2180"`
 	Buildings      int
+	// Local-space bounding box extracted from POSITION accessor min/max.
+	BoundsMinX, BoundsMaxX float32
+	BoundsMinZ, BoundsMaxZ float32
+	HasBounds              bool
 }
 
 type parsedBuildingGLB struct {
@@ -644,12 +677,21 @@ func parseBuildingRegionsMetadata(glbPaths []string, terrain *terrainData) ([]bu
 			problems = append(problems, fmt.Errorf("%s: %w", filepath.Base(path), err))
 			continue
 		}
-		regions = append(regions, buildingRegion{
+		pos := buildingRegionPosition(terrain, meta.OriginEPSG2180)
+		region := buildingRegion{
 			Path:          path,
-			Position:      buildingRegionPosition(terrain, meta.OriginEPSG2180),
+			Position:      pos,
 			BuildingCount: meta.Buildings,
 			State:         regionStateUnloaded,
-		})
+			HasBounds:     meta.HasBounds,
+		}
+		if meta.HasBounds {
+			region.BoundsMinX = pos.X + meta.BoundsMinX
+			region.BoundsMaxX = pos.X + meta.BoundsMaxX
+			region.BoundsMinZ = pos.Z + meta.BoundsMinZ
+			region.BoundsMaxZ = pos.Z + meta.BoundsMaxZ
+		}
+		regions = append(regions, region)
 	}
 	return regions, problems
 }
@@ -693,6 +735,16 @@ func parseBuildingGLBMetadataOnly(path string) (buildingRegionMetadata, error) {
 				Buildings int `json:"buildings"`
 			} `json:"stats"`
 		} `json:"extras"`
+		Accessors []struct {
+			Type string    `json:"type"`
+			Min  []float64 `json:"min"`
+			Max  []float64 `json:"max"`
+		} `json:"accessors"`
+		Meshes []struct {
+			Primitives []struct {
+				Attributes map[string]int `json:"attributes"`
+			} `json:"primitives"`
+		} `json:"meshes"`
 	}
 	if err := json.Unmarshal(jsonBytes, &doc); err != nil {
 		return buildingRegionMetadata{}, fmt.Errorf("decode JSON: %w", err)
@@ -700,10 +752,49 @@ func parseBuildingGLBMetadataOnly(path string) (buildingRegionMetadata, error) {
 	if len(doc.Extras.OriginEPSG2180) < 3 {
 		return buildingRegionMetadata{}, errors.New("missing origin_epsg2180")
 	}
-	return buildingRegionMetadata{
+
+	meta := buildingRegionMetadata{
 		OriginEPSG2180: doc.Extras.OriginEPSG2180,
 		Buildings:      doc.Extras.Stats.Buildings,
-	}, nil
+	}
+
+	// Derive the horizontal AABB from POSITION accessor min/max so the
+	// streaming system measures distance to the nearest edge, not the origin.
+	minX, maxX := math.MaxFloat64, -math.MaxFloat64
+	minZ, maxZ := math.MaxFloat64, -math.MaxFloat64
+	for _, mesh := range doc.Meshes {
+		for _, prim := range mesh.Primitives {
+			ai, ok := prim.Attributes["POSITION"]
+			if !ok || ai < 0 || ai >= len(doc.Accessors) {
+				continue
+			}
+			acc := doc.Accessors[ai]
+			if acc.Type != "VEC3" || len(acc.Min) < 3 || len(acc.Max) < 3 {
+				continue
+			}
+			if acc.Min[0] < minX {
+				minX = acc.Min[0]
+			}
+			if acc.Max[0] > maxX {
+				maxX = acc.Max[0]
+			}
+			if acc.Min[2] < minZ {
+				minZ = acc.Min[2]
+			}
+			if acc.Max[2] > maxZ {
+				maxZ = acc.Max[2]
+			}
+		}
+	}
+	if minX <= maxX && minZ <= maxZ {
+		meta.BoundsMinX = float32(minX)
+		meta.BoundsMaxX = float32(maxX)
+		meta.BoundsMinZ = float32(minZ)
+		meta.BoundsMaxZ = float32(maxZ)
+		meta.HasBounds = true
+	}
+
+	return meta, nil
 }
 
 func parseBuildingGLBWithMetadata(path string) (parsedBuildingGLB, buildingRegionMetadata, error) {
