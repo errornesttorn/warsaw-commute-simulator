@@ -231,8 +231,12 @@ func drawTreeTrunks(visibleTrees []visibleTreeDraw) {
 			trunkHeight = 1.4
 		}
 
+		crownHeight := tree.Height * 0.78 * style.HeightScale
+		if !tree.IsShrub && crownHeight < 2.2 {
+			crownHeight = 2.2
+		}
 		trunkPos := rl.NewVector3(tree.X, tree.BaseY, tree.Z)
-		rl.DrawCylinder(trunkPos, tree.TrunkRadius*0.8, tree.TrunkRadius, trunkHeight, 6, trunkColor)
+		rl.DrawCylinder(trunkPos, tree.TrunkRadius*0.8, tree.TrunkRadius, trunkHeight+crownHeight*0.20, 6, trunkColor)
 	}
 }
 
@@ -434,10 +438,10 @@ func drawGeneratedFoliageSprite(atlas *image.NRGBA, spriteSize int, variant int)
 			}
 
 			leafNoise := foliageNoise01(px, py, variant) - 0.5
-			gapNoise := foliageNoise01(px/2, py/2, variant+31)
+			clusterNoise := foliageNoiseSmooth(float64(px)/2.5, float64(py)/2.5, variant+113)
 			alphaValue := field + leafNoise*0.42
-			if gapNoise > 0.9 && field < 0.82 {
-				alphaValue -= 0.68
+			if clusterNoise < 0.25 {
+				continue
 			}
 			if alphaValue <= 0.02 {
 				continue
@@ -600,6 +604,22 @@ func seededUnit(seed uint32, salt uint32) float32 {
 func foliageNoise01(x, y int, seed int) float64 {
 	value := mixUint32(uint32(x)*0x8da6b343 ^ uint32(y)*0xd8163841 ^ uint32(seed)*0xcb1ab31f)
 	return float64(value&0xffffff) / float64(0xffffff)
+}
+
+// foliageNoiseSmooth samples foliageNoise01 at fractional coordinates using
+// bilinear interpolation with smoothstep weights for continuous, non-pixelated output.
+func foliageNoiseSmooth(x, y float64, seed int) float64 {
+	ix := int(math.Floor(x))
+	iy := int(math.Floor(y))
+	fx := x - math.Floor(x)
+	fy := y - math.Floor(y)
+	ux := fx * fx * (3 - 2*fx)
+	uy := fy * fy * (3 - 2*fy)
+	v00 := foliageNoise01(ix, iy, seed)
+	v10 := foliageNoise01(ix+1, iy, seed)
+	v01 := foliageNoise01(ix, iy+1, seed)
+	v11 := foliageNoise01(ix+1, iy+1, seed)
+	return v00*(1-ux)*(1-uy) + v10*ux*(1-uy) + v01*(1-ux)*uy + v11*ux*uy
 }
 
 func mixUint32(value uint32) uint32 {
@@ -1396,9 +1416,9 @@ func loadShrubInstances(shrubPath string, terrain *terrainData) ([]treeInstance,
 
 	var shrubs []treeInstance
 
-	// Determine density: e.g. 1 shrub roughly every 8 sq meters
+	// Determine density: e.g. 1 shrub roughly every 16 sq meters
 	// Reduced by 4x from previous 0.03
-	prob := 0.0075
+	prob := 0.00375
 
 	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 		worldY := north - (float64(y-bounds.Min.Y)/float64(height))*(north-south)
