@@ -133,8 +133,6 @@ func prepareTerrainCPU(mapDef *mapDefinition, meshMaxDim, textureMaxDim int) (*t
 }
 
 func finishTerrainGPU(cpu *terrainCPUData) (*terrainData, error) {
-	heightImage := rl.NewImage(cpu.heightGray.Pix, int32(cpu.cropW), int32(cpu.cropH), 1, rl.UncompressedGrayscale)
-
 	source := cpu.source
 	t := &terrainData{
 		orthoTiles:    source.orthoTiles,
@@ -162,7 +160,7 @@ func finishTerrainGPU(cpu *terrainCPUData) (*terrainData, error) {
 		worldNorth:    source.worldNorth,
 	}
 
-	t.tiles = buildTerrainTiles(t, heightImage, cpu.textureRGBA, source, terrainTileGridN)
+	t.tiles = buildTerrainTiles(t, cpu.textureRGBA, source, terrainTileGridN)
 	if len(t.tiles) == 0 {
 		return nil, errors.New("failed to build terrain tiles")
 	}
@@ -364,4 +362,3 @@ func fitDimensionsBySpan(spanX, spanY float64, targetMaxDim int) (int, int) {
 	}
 	return w, h
 }
-

@@ -42,9 +42,30 @@ func textureBytes(tex rl.Texture2D) int64 {
 }
 
 func meshBytes(m rl.Mesh) int64 {
-	// Rough estimate: position(12) + texcoord(8) + normal(12) + color(4) ≈ 36B
-	// per vertex. Triangles, when indexed, add 6B per triangle (3×u16).
-	return int64(m.VertexCount)*36 + int64(m.TriangleCount)*6
+	vertexCount := int64(m.VertexCount)
+	total := int64(0)
+	if m.Vertices != nil {
+		total += vertexCount * 3 * 4
+	}
+	if m.Texcoords != nil {
+		total += vertexCount * 2 * 4
+	}
+	if m.Texcoords2 != nil {
+		total += vertexCount * 2 * 4
+	}
+	if m.Normals != nil {
+		total += vertexCount * 3 * 4
+	}
+	if m.Tangents != nil {
+		total += vertexCount * 4 * 4
+	}
+	if m.Colors != nil {
+		total += vertexCount * 4
+	}
+	if m.Indices != nil {
+		total += int64(m.TriangleCount) * 3 * 2
+	}
+	return total
 }
 
 func collectVRAM(a *App) vramReport {
@@ -54,7 +75,11 @@ func collectVRAM(a *App) vramReport {
 		r.terrainTextureMinW = 1 << 30
 		for _, tile := range a.terrain.tiles {
 			r.terrainTextures += textureBytes(tile.texture)
-			r.terrainMeshes += meshBytes(tile.mesh)
+			if tile.meshBytes > 0 {
+				r.terrainMeshes += tile.meshBytes
+			} else {
+				r.terrainMeshes += meshBytes(tile.mesh)
+			}
 			if tile.texture.Width > r.terrainTextureMaxW {
 				r.terrainTextureMaxW = tile.texture.Width
 			}

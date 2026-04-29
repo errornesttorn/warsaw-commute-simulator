@@ -13,8 +13,8 @@ import (
 const (
 	buildingLoadRadius           = 1800.0
 	buildingEvictRadius          = 2400.0
-	buildingMedQualityRadius     = 300.0 // upgrade Low→Med within this distance
-	buildingFullQualityRadius    = 100.0 // upgrade Med→Full within this distance
+	buildingMedQualityRadius     = 400.0 // upgrade Low→Med within this distance
+	buildingFullQualityRadius    = 120.0 // upgrade Med→Full within this distance
 	buildingMaxResident          = 16
 	buildingUploadStepsPerFrame  = 4
 	buildingUpgradeStepsPerFrame = 2

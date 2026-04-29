@@ -1,31 +1,38 @@
 package main
 
+/*
+#include <stdlib.h>
+*/
+import "C"
+
 import (
 	"image"
 	"math"
 	"sort"
 	"sync"
 	"time"
+	"unsafe"
 
 	rl "github.com/gen2brain/raylib-go/raylib"
 )
 
 const (
-	terrainTileGridN           = 64
-	terrainTileHighResDim      = 1024
-	terrainTileUltraResDim     = 2048
-	terrainTileExtremeResDim   = 4096
-	terrainTileExtremeNearestN = 4
-	terrainTileUltraNearestN   = 24
-	terrainTileHighNearestN    = 96 // tiles ranked beyond this drop back to base
+	terrainTileGridN           = 128
+	terrainTileHighResDim      = 512
+	terrainTileUltraResDim     = 1024
+	terrainTileExtremeResDim   = 2048
+	terrainTileExtremeNearestN = 8
+	terrainTileUltraNearestN   = 48
+	terrainTileHighNearestN    = 128 // tiles ranked beyond this drop back to base
 	terrainTileUploadsPerFrame = 3
 )
 
 // Tile quality tiers, in increasing detail:
-//   0 base    — initial slice of the loading-time mosaic (~1024² per tile)
-//   1 high    — streamed at terrainTileHighResDim (everywhere, eventually)
-//   2 ultra   — streamed at terrainTileUltraResDim, top-N closest tiles
-//   3 extreme — streamed at terrainTileExtremeResDim, top-M closest tiles
+//
+//	0 base    — initial slice of the loading-time mosaic (~1024² per tile)
+//	1 high    — streamed at terrainTileHighResDim (everywhere, eventually)
+//	2 ultra   — streamed at terrainTileUltraResDim, top-N closest tiles
+//	3 extreme — streamed at terrainTileExtremeResDim, top-M closest tiles
 //
 // Closest tiles get the highest tier; farther rings degrade. Targets are
 // recomputed on every worker iteration from the latest camera position.
@@ -40,6 +47,7 @@ type terrainTile struct {
 	gridX, gridZ int
 
 	mesh        rl.Mesh
+	meshBytes   int64
 	material    rl.Material
 	texture     rl.Texture2D // currently-bound texture (may equal baseTexture)
 	baseTexture rl.Texture2D // initial low-res slice; kept alive for cheap downgrade
@@ -71,12 +79,11 @@ type terrainStreaming struct {
 	camX, camZ float32
 }
 
-func buildTerrainTiles(t *terrainData, heightImage *rl.Image, baseMosaic *image.RGBA, source *preparedTerrainSource, gridN int) []*terrainTile {
+func buildTerrainTiles(t *terrainData, baseMosaic *image.RGBA, source *preparedTerrainSource, gridN int) []*terrainTile {
 	meshW := t.meshWidth
 	meshH := t.meshHeight
 	spanX := float64(t.widthMeters)
 	spanZ := float64(t.depthMeters)
-	spanY := t.heightMeters
 
 	baseW := baseMosaic.Bounds().Dx()
 	baseH := baseMosaic.Bounds().Dy()
@@ -102,12 +109,9 @@ func buildTerrainTiles(t *terrainData, heightImage *rl.Image, baseMosaic *image.
 				continue
 			}
 
-			cropRect := rl.NewRectangle(float32(x0), float32(z0), float32(tileW), float32(tileH))
-			tileHeight := rl.ImageFromImage(*heightImage, cropRect)
 			tileSpanX := float32(float64(x1-x0) / float64(meshW-1) * spanX)
 			tileSpanZ := float32(float64(z1-z0) / float64(meshH-1) * spanZ)
-			mesh := rl.GenMeshHeightmap(tileHeight, rl.NewVector3(tileSpanX, spanY, tileSpanZ))
-			rl.UnloadImage(&tileHeight)
+			mesh, meshBytes := buildTerrainTileMesh(t, x0, x1, z0, z1, tileSpanX, tileSpanZ)
 
 			worldWest := source.worldWest + float64(x0)/float64(meshW-1)*(source.worldEast-source.worldWest)
 			worldEast := source.worldWest + float64(x1)/float64(meshW-1)*(source.worldEast-source.worldWest)
@@ -148,6 +152,7 @@ func buildTerrainTiles(t *terrainData, heightImage *rl.Image, baseMosaic *image.
 				gridX:         gx,
 				gridZ:         gz,
 				mesh:          mesh,
+				meshBytes:     meshBytes,
 				material:      mat,
 				texture:       tex,
 				baseTexture:   tex,
@@ -163,6 +168,107 @@ func buildTerrainTiles(t *terrainData, heightImage *rl.Image, baseMosaic *image.
 		}
 	}
 	return tiles
+}
+
+func terrainMeshIndexSentinel() *uint16 {
+	return (*uint16)(C.malloc(C.size_t(2)))
+}
+
+func freeTerrainMeshIndexSentinel(ptr *uint16) {
+	if ptr != nil {
+		C.free(unsafe.Pointer(ptr))
+	}
+}
+
+func buildTerrainTileMesh(t *terrainData, x0, x1, z0, z1 int, tileSpanX, tileSpanZ float32) (rl.Mesh, int64) {
+	tileW := x1 - x0 + 1
+	tileH := z1 - z0 + 1
+	vertexCount := tileW * tileH
+	triangleCount := (tileW - 1) * (tileH - 1) * 2
+
+	vertices := make([]float32, vertexCount*3)
+	normals := make([]float32, vertexCount*3)
+	texcoords := make([]float32, vertexCount*2)
+	indices := make([]uint16, triangleCount*3)
+
+	stepX := tileSpanX / float32(tileW-1)
+	stepZ := tileSpanZ / float32(tileH-1)
+	fullStepX := float64(t.widthMeters) / float64(t.meshWidth-1)
+	fullStepZ := float64(t.depthMeters) / float64(t.meshHeight-1)
+
+	for z := 0; z < tileH; z++ {
+		srcZ := z0 + z
+		for x := 0; x < tileW; x++ {
+			srcX := x0 + x
+			i := z*tileW + x
+			v := i * 3
+			tc := i * 2
+
+			vertices[v] = float32(x) * stepX
+			vertices[v+1] = float32(t.heightSamples[srcZ*t.meshWidth+srcX] - t.heightMin)
+			vertices[v+2] = float32(z) * stepZ
+			texcoords[tc] = float32(x) / float32(tileW-1)
+			texcoords[tc+1] = float32(z) / float32(tileH-1)
+
+			leftX := max(srcX-1, 0)
+			rightX := min(srcX+1, t.meshWidth-1)
+			upZ := max(srcZ-1, 0)
+			downZ := min(srcZ+1, t.meshHeight-1)
+			dx := float64(rightX-leftX) * fullStepX
+			dz := float64(downZ-upZ) * fullStepZ
+			if dx <= 0 {
+				dx = 1
+			}
+			if dz <= 0 {
+				dz = 1
+			}
+			dhDx := (t.heightSamples[srcZ*t.meshWidth+rightX] - t.heightSamples[srcZ*t.meshWidth+leftX]) / dx
+			dhDz := (t.heightSamples[downZ*t.meshWidth+srcX] - t.heightSamples[upZ*t.meshWidth+srcX]) / dz
+			nx, ny, nz := -dhDx, 1.0, -dhDz
+			invLen := 1.0 / math.Sqrt(nx*nx+ny*ny+nz*nz)
+			normals[v] = float32(nx * invLen)
+			normals[v+1] = float32(ny * invLen)
+			normals[v+2] = float32(nz * invLen)
+		}
+	}
+
+	out := 0
+	for z := 0; z < tileH-1; z++ {
+		for x := 0; x < tileW-1; x++ {
+			topLeft := uint16(z*tileW + x)
+			bottomLeft := uint16((z+1)*tileW + x)
+			topRight := uint16(z*tileW + x + 1)
+			bottomRight := uint16((z+1)*tileW + x + 1)
+			indices[out] = topLeft
+			indices[out+1] = bottomLeft
+			indices[out+2] = topRight
+			indices[out+3] = topRight
+			indices[out+4] = bottomLeft
+			indices[out+5] = bottomRight
+			out += 6
+		}
+	}
+
+	mesh := rl.Mesh{
+		VertexCount:   int32(vertexCount),
+		TriangleCount: int32(triangleCount),
+		Vertices:      &vertices[0],
+		Normals:       &normals[0],
+		Texcoords:     &texcoords[0],
+		Indices:       &indices[0],
+	}
+	rl.UploadMesh(&mesh, false)
+
+	meshBytes := int64(vertexCount)*((3+3+2)*4) + int64(triangleCount)*3*2
+
+	// UploadMesh copies data to GPU buffers. Keep a C-allocated non-nil index
+	// sentinel because Raylib uses mesh.Indices as the indexed-draw flag, but
+	// do not keep Go slice pointers in the stored Mesh.
+	mesh.Vertices = nil
+	mesh.Normals = nil
+	mesh.Texcoords = nil
+	mesh.Indices = terrainMeshIndexSentinel()
+	return mesh, meshBytes
 }
 
 func drawTerrainTiles(t *terrainData) {
@@ -190,6 +296,8 @@ func unloadTerrainTiles(t *terrainData) {
 		t.streaming = nil
 	}
 	for _, tile := range t.tiles {
+		freeTerrainMeshIndexSentinel(tile.mesh.Indices)
+		tile.mesh.Indices = nil
 		rl.UnloadMesh(&tile.mesh)
 		// UnloadMaterial unloads the currently-bound albedo texture. If the
 		// base texture isn't the one bound (i.e. tile is upgraded), free it
@@ -336,10 +444,10 @@ func pickNextStreamingJob(t *terrainData, s *terrainStreaming) (int, int) {
 }
 
 // pumpTerrainStreaming runs one frame of the tile streaming logic:
-//   1. Reports the latest camera XZ to the worker for prioritization.
-//   2. Downgrades tiles that have drifted out of their target ring back to the
-//      base texture so VRAM stays bounded as the camera moves around.
-//   3. Uploads up to terrainTileUploadsPerFrame ready high-res results.
+//  1. Reports the latest camera XZ to the worker for prioritization.
+//  2. Downgrades tiles that have drifted out of their target ring back to the
+//     base texture so VRAM stays bounded as the camera moves around.
+//  3. Uploads up to terrainTileUploadsPerFrame ready high-res results.
 func pumpTerrainStreaming(t *terrainData, cameraX, cameraZ float32) {
 	if t == nil || t.streaming == nil {
 		return
