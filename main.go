@@ -36,20 +36,38 @@ const (
 )
 
 type App struct {
-	world         *simpkg.World
-	loaded        bool
-	paused        bool
-	showPaths     bool
-	terrain       *terrainData
-	objects       *sceneObjects
-	mapName       string
-	camPos        rl.Vector3
-	yaw           float32
-	pitch         float32
-	mouseCaptured bool
-	unitCube      rl.Model
-	loader        *mapLoader
-	showVRAM      bool
+	world                      *simpkg.World
+	loaded                     bool
+	paused                     bool
+	showPaths                  bool
+	terrain                    *terrainData
+	objects                    *sceneObjects
+	mapDef                     *mapDefinition
+	mapName                    string
+	camPos                     rl.Vector3
+	yaw                        float32
+	pitch                      float32
+	mouseCaptured              bool
+	unitCube                   rl.Model
+	loader                     *mapLoader
+	showVRAM                   bool
+	editMode                   bool
+	propTool                   propEditTool
+	selectedProp               int
+	selectedLinearProp         int
+	availablePropAssets        []string
+	currentPropAsset           string
+	currentLinearAsset         string
+	currentPropHeading         float32
+	currentLinearHeadingOffset float32
+	currentPropScale           float32
+	currentLinearScale         float32
+	currentLinearSpacing       float32
+	linearDraft                []linearPropPoint
+	draggingProp               bool
+	propDirty                  bool
+	propStatus                 string
+	propStatusUntil            float64
 }
 
 type loaderPhase int
@@ -113,11 +131,18 @@ func main() {
 	rl.DisableCursor()
 
 	app := &App{
-		camPos:        rl.NewVector3(0, 10, 0),
-		pitch:         -20,
-		mouseCaptured: true,
-		showPaths:     true,
-		unitCube:      rl.LoadModelFromMesh(rl.GenMeshCube(1, 1, 1)),
+		camPos:               rl.NewVector3(0, 10, 0),
+		pitch:                -20,
+		mouseCaptured:        true,
+		showPaths:            true,
+		unitCube:             rl.LoadModelFromMesh(rl.GenMeshCube(1, 1, 1)),
+		selectedProp:         -1,
+		selectedLinearProp:   -1,
+		currentPropAsset:     defaultPropAsset,
+		currentLinearAsset:   defaultLinearPropAsset,
+		currentPropScale:     1,
+		currentLinearScale:   1,
+		currentLinearSpacing: defaultLinearSpacingM,
 	}
 	defer rl.UnloadModel(app.unitCube)
 	defer func() { unloadTerrain(app.terrain) }()
@@ -143,7 +168,7 @@ func (a *App) update() {
 		return
 	}
 
-	if rl.IsKeyPressed(rl.KeyTab) {
+	if rl.IsKeyPressed(rl.KeyTab) && !a.editMode {
 		a.mouseCaptured = !a.mouseCaptured
 		if a.mouseCaptured {
 			rl.DisableCursor()
@@ -168,11 +193,29 @@ func (a *App) update() {
 		a.showVRAM = !a.showVRAM
 	}
 
+	if rl.IsKeyPressed(rl.KeyF2) {
+		a.togglePropEditor()
+	}
+
+	if a.editMode {
+		a.updatePropEditor()
+	}
+
 	if a.loaded && !a.paused {
 		a.world.Step(dt)
 	}
 
-	if a.mouseCaptured {
+	if a.editMode && rl.IsMouseButtonDown(rl.MouseRightButton) {
+		delta := rl.GetMouseDelta()
+		a.yaw -= delta.X * mouseSens
+		a.pitch -= delta.Y * mouseSens
+		if a.pitch > 89 {
+			a.pitch = 89
+		}
+		if a.pitch < -89 {
+			a.pitch = -89
+		}
+	} else if a.mouseCaptured {
 		delta := rl.GetMouseDelta()
 		a.yaw -= delta.X * mouseSens
 		a.pitch -= delta.Y * mouseSens
@@ -198,7 +241,8 @@ func (a *App) update() {
 	if rl.IsKeyDown(rl.KeyW) {
 		a.camPos = addVec3(a.camPos, scaleVec3(fwd, speed*dt))
 	}
-	if rl.IsKeyDown(rl.KeyS) {
+	ctrlDown := rl.IsKeyDown(rl.KeyLeftControl) || rl.IsKeyDown(rl.KeyRightControl)
+	if rl.IsKeyDown(rl.KeyS) && !(a.editMode && ctrlDown) {
 		a.camPos = addVec3(a.camPos, scaleVec3(fwd, -speed*dt))
 	}
 	if rl.IsKeyDown(rl.KeyA) {
@@ -235,7 +279,7 @@ func (a *App) draw() {
 	rl.BeginMode3D(camera)
 	if a.terrain != nil {
 		drawTerrainTiles(a.terrain)
-		drawSceneObjects(camera, a.objects)
+		drawSceneObjects(camera, a.terrain, a.objects)
 	} else {
 		rl.DrawGrid(200, 1.0)
 	}
@@ -248,6 +292,9 @@ func (a *App) draw() {
 		a.drawTrafficLights()
 		a.drawCars()
 		a.drawPedestrians()
+	}
+	if a.editMode {
+		a.drawPropEditor3D(camera)
 	}
 
 	rl.EndMode3D()
@@ -541,7 +588,10 @@ func (a *App) drawHUD() {
 	rl.DrawLine(cx-10, cy, cx+10, cy, rl.White)
 	rl.DrawLine(cx, cy-10, cx, cy+10, rl.White)
 
-	helpText := "TAB: toggle mouse | Ctrl+O: open | WASD+E/Q: fly | Space: pause | P: paths | F3: vram | Shift: sprint"
+	helpText := "TAB: toggle mouse | Ctrl+O: open | WASD+E/Q: fly | Space: pause | P: paths | F2: props | F3: vram | Shift: sprint"
+	if a.editMode {
+		helpText = "PROP EDIT | click asset | 1 prop | 2 select | 3 linear | LMB action | Enter commit line | MMB rotate | ,/. spacing | Ctrl+S save"
+	}
 	rl.DrawText(helpText, 8, h-24, 14, rl.LightGray)
 
 	if a.paused {
@@ -563,14 +613,20 @@ func (a *App) drawHUD() {
 			residentRegions, inFlightRegions, upgradingRegions = residentBuildingRegions(a.objects)
 			trees = len(a.objects.Trees)
 		}
-		info := fmt.Sprintf("Cars: %d  Splines: %d  Peds: %d  Buildings: %d  GLB: %d/%d (+%d loading, %d upgrading)  Trees: %d  Pos: (%.1f, %.1f, %.1f)",
+		props := 0
+		if a.objects != nil {
+			props = len(a.objects.Props)
+		}
+		info := fmt.Sprintf("Cars: %d  Splines: %d  Peds: %d  Buildings: %d  GLB: %d/%d (+%d loading, %d upgrading)  Trees: %d  Props: %d  Pos: (%.1f, %.1f, %.1f)",
 			len(a.world.Cars), len(a.world.Splines), len(a.world.Pedestrians),
-			buildings, residentRegions, totalRegions, inFlightRegions, upgradingRegions, trees,
+			buildings, residentRegions, totalRegions, inFlightRegions, upgradingRegions, trees, props,
 			a.camPos.X, a.camPos.Y, a.camPos.Z)
 		rl.DrawText(info, 8, 8, 16, rl.White)
 	}
 
-	if !a.mouseCaptured {
+	if a.editMode {
+		a.drawPropEditorHUD(w, h)
+	} else if !a.mouseCaptured {
 		msg := "MOUSE RELEASED - press TAB to recapture"
 		rl.DrawText(msg, w/2-int32(rl.MeasureText(msg, 16))/2, 8, 16, rl.Orange)
 	}
@@ -791,23 +847,37 @@ func (a *App) installLoadedMap() {
 	for i := range l.scene.Regions {
 		totalBuildings += l.scene.Regions[i].BuildingCount
 	}
+	propAssets, propProblems := loadPropAssets(l.mapDef, l.scene.Props, l.scene.LinearProps)
+	problems := append([]error(nil), l.scene.Problems...)
+	problems = append(problems, propProblems...)
 	objects := &sceneObjects{
 		BuildingRegions: l.scene.Regions,
 		BuildingCount:   totalBuildings,
 		Trees:           l.scene.Trees,
 		TreeFoliage:     l.foliage,
+		Props:           l.scene.Props,
+		LinearProps:     l.scene.LinearProps,
+		PropAssets:      propAssets,
 	}
 
 	unloadTerrain(a.terrain)
 	unloadSceneObjects(a.objects)
 	a.terrain = l.terrainData
 	a.objects = objects
+	a.mapDef = l.mapDef
 	a.mapName = l.mapDef.Name
 	a.world = nil
 	a.loaded = false
+	a.editMode = false
+	a.selectedProp = -1
+	a.selectedLinearProp = -1
+	a.availablePropAssets = discoverPropAssets(l.mapDef, l.scene.Props, l.scene.LinearProps)
+	a.linearDraft = nil
+	a.draggingProp = false
+	a.propDirty = false
 
-	if len(l.problems) > 0 {
-		fmt.Printf("Map loaded, but scene object load had problems: %v\n", errors.Join(l.problems...))
+	if len(problems) > 0 {
+		fmt.Printf("Map loaded, but scene object load had problems: %v\n", errors.Join(problems...))
 	}
 
 	if l.mapDef.Simulation != "" {

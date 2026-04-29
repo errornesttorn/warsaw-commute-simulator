@@ -27,6 +27,9 @@ type sceneObjects struct {
 	BuildingCount   int
 	TreeFoliage     treeFoliageResources
 	Trees           []treeInstance
+	Props           []propInstance
+	LinearProps     []linearPropInstance
+	PropAssets      map[string]*propAsset
 	streaming       *buildingStreaming
 }
 
@@ -152,6 +155,8 @@ type treeRenderStyle struct {
 type sceneCPUData struct {
 	Regions      []buildingRegion
 	Trees        []treeInstance
+	Props        []propInstance
+	LinearProps  []linearPropInstance
 	FoliageAtlas *image.NRGBA
 	Problems     []error
 }
@@ -196,6 +201,14 @@ func prepareSceneCPU(mapDef *mapDefinition, terrain *terrainData, progress func(
 		}
 		out.FoliageAtlas = buildFoliageAtlas()
 	}
+
+	if progress != nil {
+		progress("loading prop layers")
+	}
+	props, linearProps, propProblems := loadPropInstances(mapDef)
+	out.Props = props
+	out.LinearProps = linearProps
+	out.Problems = append(out.Problems, propProblems...)
 	return out
 }
 
@@ -214,9 +227,10 @@ func unloadSceneObjects(objects *sceneObjects) {
 		// so do not unload Texture/Shader explicitly here — that's a double-free.
 		rl.UnloadMaterial(objects.TreeFoliage.Material)
 	}
+	unloadPropAssets(objects.PropAssets)
 }
 
-func drawSceneObjects(camera rl.Camera, objects *sceneObjects) {
+func drawSceneObjects(camera rl.Camera, terrain *terrainData, objects *sceneObjects) {
 	if objects == nil {
 		return
 	}
@@ -227,6 +241,7 @@ func drawSceneObjects(camera rl.Camera, objects *sceneObjects) {
 		}
 		drawStreamedBuildingModel(region.Model, region.Position)
 	}
+	drawProps(terrain, objects)
 
 	visibleTrees := visibleTreesForCamera(camera, objects.Trees)
 	drawTreeTrunks(visibleTrees)
@@ -601,7 +616,7 @@ func treeRenderStyleFor(tree treeInstance) treeRenderStyle {
 		return treeRenderStyle{
 			Variant:     int(seed % 10),
 			WidthScale:  0.8 + seededUnit(seed, 5)*0.6,
-			HeightScale: 0.5 + seededUnit(seed, 9)*1.0,           // Semi-randomised height scale
+			HeightScale: 0.5 + seededUnit(seed, 9)*1.0,            // Semi-randomised height scale
 			LogRatio:    0.0 + float32(seededUnit(seed, 45)*0.18), // Semi-randomised leaf-to-log ratio (still low)
 			Tint: rl.NewColor(
 				uint8(180+seededUnit(seed, 13)*30),

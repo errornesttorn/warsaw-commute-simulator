@@ -34,6 +34,8 @@ type mapManifest struct {
 	BuildingGLBs []string          `json:"building_glbs,omitempty"`
 	TreeFiles    []string          `json:"tree_files,omitempty"`
 	ShrubMasks   []string          `json:"shrub_masks,omitempty"`
+	PropLayers   []string          `json:"prop_layers,omitempty"`
+	ObjectLayers []string          `json:"object_layers,omitempty"`
 }
 
 type mapManifestTile struct {
@@ -56,6 +58,7 @@ type mapDefinition struct {
 	BuildingGLBPaths []string
 	TreePaths        []string
 	ShrubMaskPaths   []string
+	PropLayerPaths   []string
 	RaylibCenterX    float64
 	RaylibCenterY    float64
 	RaylibCenterZ    float64
@@ -198,6 +201,14 @@ func loadMapDefinition(mapPath string) (*mapDefinition, error) {
 		return nil, fmt.Errorf("resolve shrub mask files: %w", err)
 	}
 	mapDef.ShrubMaskPaths = shrubMaskPaths
+
+	propLayerEntries := append([]string(nil), manifest.PropLayers...)
+	propLayerEntries = append(propLayerEntries, manifest.ObjectLayers...)
+	propLayerPaths, err := resolveMapFilePatterns(baseDir, propLayerEntries)
+	if err != nil {
+		return nil, fmt.Errorf("resolve prop layer files: %w", err)
+	}
+	mapDef.PropLayerPaths = propLayerPaths
 
 	if manifest.RaylibCenter != nil {
 		mapDef.RaylibCenterX = manifest.RaylibCenter.X
