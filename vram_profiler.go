@@ -12,12 +12,16 @@ import (
 type vramReport struct {
 	terrainTextures int64
 	terrainMeshes   int64
+	roadCutTex      int64
+	roadMeshes      int64
 	buildingTex     int64
 	buildingMeshes  int64
 	foliageTex      int64
 	foliageMesh     int64
 
 	terrainTileCount   int
+	roadCutTexCount    int
+	roadMeshCount      int
 	buildingTexCount   int
 	buildingMeshCount  int
 	terrainTextureMaxW int32
@@ -33,12 +37,31 @@ func textureBytes(tex rl.Texture2D) int64 {
 	if tex.ID == 0 {
 		return 0
 	}
-	base := int64(tex.Width) * int64(tex.Height) * 4
+	base := int64(tex.Width) * int64(tex.Height) * textureBytesPerPixel(tex.Format)
 	if tex.Mipmaps > 1 {
 		// Geometric series 1 + 1/4 + 1/16 + ... ≈ 4/3 of base.
 		return base * 4 / 3
 	}
 	return base
+}
+
+func textureBytesPerPixel(format rl.PixelFormat) int64 {
+	switch format {
+	case rl.UncompressedGrayscale:
+		return 1
+	case rl.UncompressedGrayAlpha, rl.UncompressedR5g6b5, rl.UncompressedR5g5b5a1, rl.UncompressedR4g4b4a4:
+		return 2
+	case rl.UncompressedR8g8b8:
+		return 3
+	case rl.UncompressedR32g32b32a32:
+		return 16
+	case rl.UncompressedR32g32b32:
+		return 12
+	case rl.UncompressedR32:
+		return 4
+	default:
+		return 4
+	}
 }
 
 func meshBytes(m rl.Mesh) int64 {
@@ -86,9 +109,25 @@ func collectVRAM(a *App) vramReport {
 			if tile.texture.Width < r.terrainTextureMinW {
 				r.terrainTextureMinW = tile.texture.Width
 			}
+			if tile.roadCut.ID != 0 {
+				r.roadCutTex += textureBytes(tile.roadCut)
+				r.roadCutTexCount++
+			}
 		}
 		if r.terrainTileCount == 0 {
 			r.terrainTextureMinW = 0
+		}
+		if roads := a.terrain.roads; roads != nil {
+			for _, surface := range roads.Surfaces {
+				if surface.Loaded {
+					r.roadMeshes += surface.MeshBytes
+					r.roadMeshCount++
+				}
+			}
+			if roads.HardCurbs.Loaded {
+				r.roadMeshes += roads.HardCurbs.MeshBytes
+				r.roadMeshCount++
+			}
 		}
 	}
 	if a.objects != nil {
@@ -144,7 +183,7 @@ func formatBytes(b int64) string {
 func drawVRAMProfiler(a *App) {
 	r := collectVRAM(a)
 
-	terrainTotal := r.terrainTextures + r.terrainMeshes
+	terrainTotal := r.terrainTextures + r.terrainMeshes + r.roadCutTex + r.roadMeshes
 	buildingTotal := r.buildingTex + r.buildingMeshes
 	foliageTotal := r.foliageTex + r.foliageMesh
 	grand := terrainTotal + buildingTotal + foliageTotal
@@ -166,6 +205,8 @@ func drawVRAMProfiler(a *App) {
 		fmt.Sprintf("Terrain tiles (%d):       %s", r.terrainTileCount, formatBytes(terrainTotal)),
 		fmt.Sprintf("  textures:               %s", formatBytes(r.terrainTextures)),
 		fmt.Sprintf("  meshes:                 %s", formatBytes(r.terrainMeshes)),
+		fmt.Sprintf("  road cuts (%d):          %s", r.roadCutTexCount, formatBytes(r.roadCutTex)),
+		fmt.Sprintf("  road meshes (%d):        %s", r.roadMeshCount, formatBytes(r.roadMeshes)),
 		fmt.Sprintf("  tile dim min/max:       %d / %d", r.terrainTextureMinW, r.terrainTextureMaxW),
 		fmt.Sprintf("  quality base/high/ultra/extreme: %d / %d / %d / %d",
 			qCounts[0], qCounts[1], qCounts[2], qCounts[3]),

@@ -1418,7 +1418,17 @@ func terrainContainsPoint(terrain *terrainData, worldX, worldY float64) bool {
 }
 
 func terrainHeightAt(terrain *terrainData, worldX, worldY float64) float32 {
-	if len(terrain.heightSamples) == 0 || terrain.meshWidth < 2 || terrain.meshHeight < 2 {
+	base := terrainBaseHeightAt(terrain, worldX, worldY)
+	if terrain != nil && terrain.roads != nil {
+		localX := float32(worldX - terrain.centerWorldX)
+		localZ := float32(terrain.centerWorldY - worldY)
+		return terrain.roads.heightAtLocal(localX, localZ, base)
+	}
+	return base
+}
+
+func terrainBaseHeightAt(terrain *terrainData, worldX, worldY float64) float32 {
+	if terrain == nil || len(terrain.heightSamples) == 0 || terrain.meshWidth < 2 || terrain.meshHeight < 2 {
 		return 0
 	}
 

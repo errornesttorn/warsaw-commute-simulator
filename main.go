@@ -278,7 +278,8 @@ func (a *App) draw() {
 	rl.SetClipPlanes(0.01, 2000.0)
 	rl.BeginMode3D(camera)
 	if a.terrain != nil {
-		drawTerrainTiles(a.terrain)
+		drawTerrainWithRoadCuts(a.terrain)
+		drawRoadSurfaceLayer(a.terrain)
 		drawSceneObjects(camera, a.terrain, a.objects)
 	} else {
 		rl.DrawGrid(200, 1.0)
@@ -766,7 +767,12 @@ func (a *App) openMap() {
 			return
 		}
 		fakeTerrain := terrainForSceneCPU(terrainCPU)
+		loader.setStatus("loading road surfaces")
+		roadCPU, roadProblems := prepareRoadSurfacesCPU(mapDef, fakeTerrain)
+		terrainCPU.roads = roadCPU
+		fakeTerrain.roads = roadHeightOnlyLayer(roadCPU)
 		scene := prepareSceneCPU(mapDef, fakeTerrain, loader.setStatus)
+		scene.Problems = append(scene.Problems, roadProblems...)
 		loader.terrain = terrainCPU
 		loader.scene = scene
 		loader.cpuDone.Store(true)
@@ -797,6 +803,7 @@ func terrainForSceneCPU(cpu *terrainCPUData) *terrainData {
 		worldEast:    source.worldEast,
 		worldSouth:   source.worldSouth,
 		worldNorth:   source.worldNorth,
+		roads:        roadHeightOnlyLayer(cpu.roads),
 	}
 }
 

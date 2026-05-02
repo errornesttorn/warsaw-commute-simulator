@@ -33,33 +33,38 @@ type cropRect struct {
 }
 
 type terrainData struct {
-	tiles         []*terrainTile
-	streaming     *terrainStreaming
-	orthoTiles    []orthoTileSource
-	heightSamples []float64
-	position      rl.Vector3
-	centerWorldX  float64
-	centerWorldY  float64
-	centerWorldZ  float64
-	widthMeters   float32
-	depthMeters   float32
-	heightMeters  float32
-	heightMin     float64
-	heightMax     float64
-	meshWidth     int
-	meshHeight    int
-	textureWidth  int
-	textureHeight int
-	worldWest     float64
-	worldEast     float64
-	worldSouth    float64
-	worldNorth    float64
+	tiles              []*terrainTile
+	streaming          *terrainStreaming
+	roads              *roadSurfaceLayer
+	roadCutShader      rl.Shader
+	roadCutShaderValid bool
+	roadCutCountLoc    int32
+	orthoTiles         []orthoTileSource
+	heightSamples      []float64
+	position           rl.Vector3
+	centerWorldX       float64
+	centerWorldY       float64
+	centerWorldZ       float64
+	widthMeters        float32
+	depthMeters        float32
+	heightMeters       float32
+	heightMin          float64
+	heightMax          float64
+	meshWidth          int
+	meshHeight         int
+	textureWidth       int
+	textureHeight      int
+	worldWest          float64
+	worldEast          float64
+	worldSouth         float64
+	worldNorth         float64
 }
 
 type terrainCPUData struct {
 	heightGray   *image.Gray
 	textureRGBA  *image.RGBA
 	source       *preparedTerrainSource
+	roads        *roadSurfaceCPUData
 	cropW        int
 	cropH        int
 	textureW     int
@@ -160,10 +165,17 @@ func finishTerrainGPU(cpu *terrainCPUData) (*terrainData, error) {
 		worldNorth:    source.worldNorth,
 	}
 
-	t.tiles = buildTerrainTiles(t, cpu.textureRGBA, source, terrainTileGridN)
+	t.tiles = buildTerrainTiles(t, cpu.textureRGBA, terrainTileGridN)
 	if len(t.tiles) == 0 {
 		return nil, errors.New("failed to build terrain tiles")
 	}
+	if cpu.roads != nil && len(cpu.roads.Cuts) > 0 {
+		t.roadCutShader, t.roadCutCountLoc, t.roadCutShaderValid = loadTerrainRoadCutShader()
+		if t.roadCutShaderValid {
+			uploadRoadCutSegments(t, cpu.roads)
+		}
+	}
+	t.roads = uploadRoadSurfaceLayer(cpu.roads)
 	return t, nil
 }
 
@@ -171,6 +183,8 @@ func unloadTerrain(t *terrainData) {
 	if t == nil {
 		return
 	}
+	unloadRoadSurfaceLayer(t.roads)
+	t.roads = nil
 	unloadTerrainTiles(t)
 }
 
@@ -178,6 +192,14 @@ func unloadTerrain(t *terrainData) {
 // expressed in raylib/sim local coordinates: localX is raylib X, localZ is
 // raylib Z. Returns 0 outside the terrain extent.
 func terrainHeightAtLocal(t *terrainData, localX, localZ float32) float32 {
+	base := terrainBaseHeightAtLocal(t, localX, localZ)
+	if t != nil && t.roads != nil {
+		return t.roads.heightAtLocal(localX, localZ, base)
+	}
+	return base
+}
+
+func terrainBaseHeightAtLocal(t *terrainData, localX, localZ float32) float32 {
 	if t == nil || t.meshWidth < 2 || t.meshHeight < 2 {
 		return 0
 	}
@@ -198,9 +220,13 @@ func terrainHeightAtLocal(t *terrainData, localX, localZ float32) float32 {
 	h01 := t.heightSamples[y1*t.meshWidth+x0]
 	h11 := t.heightSamples[y1*t.meshWidth+x1]
 
-	top := h00*(1-tx) + h10*tx
-	bottom := h01*(1-tx) + h11*tx
-	return float32(top*(1-ty) + bottom*ty - t.centerWorldZ)
+	var h float64
+	if tx+ty <= 1 {
+		h = h00 + (h10-h00)*tx + (h01-h00)*ty
+	} else {
+		h = h10*(1-ty) + h01*(1-tx) + h11*(tx+ty-1)
+	}
+	return float32(h - t.centerWorldZ)
 }
 
 func ensureOrthophotoCache(orthoPath string, worldWest, worldEast, worldSouth, worldNorth float64, width, height int) (string, error) {

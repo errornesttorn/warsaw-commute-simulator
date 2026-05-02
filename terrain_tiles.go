@@ -51,6 +51,8 @@ type terrainTile struct {
 	material    rl.Material
 	texture     rl.Texture2D // currently-bound texture (may equal baseTexture)
 	baseTexture rl.Texture2D // initial low-res slice; kept alive for cheap downgrade
+	roadCut     rl.Texture2D // RGBA32F boundary segments in tile UV space
+	roadCutN    int
 	position    rl.Vector3
 
 	worldWest, worldEast, worldSouth, worldNorth float64
@@ -67,6 +69,19 @@ type terrainStreamResult struct {
 	err       error
 }
 
+type terrainTileLayout struct {
+	gridX, gridZ int
+	x0, x1       int
+	z0, z1       int
+
+	tileSpanX float32
+	tileSpanZ float32
+	posX      float32
+	posZ      float32
+
+	worldWest, worldEast, worldSouth, worldNorth float64
+}
+
 type terrainStreaming struct {
 	results chan terrainStreamResult
 	quit    chan struct{}
@@ -79,20 +94,18 @@ type terrainStreaming struct {
 	camX, camZ float32
 }
 
-func buildTerrainTiles(t *terrainData, baseMosaic *image.RGBA, source *preparedTerrainSource, gridN int) []*terrainTile {
+func computeTerrainTileLayouts(t *terrainData, gridN int) []terrainTileLayout {
+	if t == nil || t.meshWidth < 2 || t.meshHeight < 2 || gridN <= 0 {
+		return nil
+	}
 	meshW := t.meshWidth
 	meshH := t.meshHeight
 	spanX := float64(t.widthMeters)
 	spanZ := float64(t.depthMeters)
 
-	baseW := baseMosaic.Bounds().Dx()
-	baseH := baseMosaic.Bounds().Dy()
-
-	tiles := make([]*terrainTile, 0, gridN*gridN)
+	layouts := make([]terrainTileLayout, 0, gridN*gridN)
 	for gz := 0; gz < gridN; gz++ {
 		for gx := 0; gx < gridN; gx++ {
-			// Inclusive pixel range; adjacent tiles share boundary samples
-			// so vertices on shared edges line up exactly (no cracks).
 			x0 := gx * (meshW - 1) / gridN
 			x1 := (gx + 1) * (meshW - 1) / gridN
 			z0 := gz * (meshH - 1) / gridN
@@ -103,69 +116,95 @@ func buildTerrainTiles(t *terrainData, baseMosaic *image.RGBA, source *preparedT
 			if gz == gridN-1 {
 				z1 = meshH - 1
 			}
-			tileW := x1 - x0 + 1
-			tileH := z1 - z0 + 1
-			if tileW < 2 || tileH < 2 {
+			if x1-x0+1 < 2 || z1-z0+1 < 2 {
 				continue
 			}
 
 			tileSpanX := float32(float64(x1-x0) / float64(meshW-1) * spanX)
 			tileSpanZ := float32(float64(z1-z0) / float64(meshH-1) * spanZ)
-			mesh, meshBytes := buildTerrainTileMesh(t, x0, x1, z0, z1, tileSpanX, tileSpanZ)
-
-			worldWest := source.worldWest + float64(x0)/float64(meshW-1)*(source.worldEast-source.worldWest)
-			worldEast := source.worldWest + float64(x1)/float64(meshW-1)*(source.worldEast-source.worldWest)
-			worldNorth := source.worldNorth - float64(z0)/float64(meshH-1)*(source.worldNorth-source.worldSouth)
-			worldSouth := source.worldNorth - float64(z1)/float64(meshH-1)*(source.worldNorth-source.worldSouth)
-
-			bx0 := int(math.Round(float64(x0) / float64(meshW-1) * float64(baseW)))
-			bx1 := int(math.Round(float64(x1) / float64(meshW-1) * float64(baseW)))
-			bz0 := int(math.Round(float64(z0) / float64(meshH-1) * float64(baseH)))
-			bz1 := int(math.Round(float64(z1) / float64(meshH-1) * float64(baseH)))
-			if bx1 <= bx0 {
-				bx1 = bx0 + 1
-			}
-			if bz1 <= bz0 {
-				bz1 = bz0 + 1
-			}
-			if bx1 > baseW {
-				bx1 = baseW
-			}
-			if bz1 > baseH {
-				bz1 = baseH
-			}
-			sub := baseMosaic.SubImage(image.Rect(bx0, bz0, bx1, bz1))
-			tileImg := goImageToRaylibImage(sub)
-			tex := rl.LoadTextureFromImage(tileImg)
-			rl.GenTextureMipmaps(&tex)
-			rl.SetTextureFilter(tex, rl.FilterAnisotropic16x)
-			rl.SetTextureWrap(tex, rl.WrapClamp)
-
-			mat := rl.LoadMaterialDefault()
-			rl.SetMaterialTexture(&mat, rl.MapAlbedo, tex)
-
 			posX := t.position.X + float32(float64(x0)/float64(meshW-1)*spanX)
 			posZ := t.position.Z + float32(float64(z0)/float64(meshH-1)*spanZ)
-			posY := t.position.Y
 
-			tiles = append(tiles, &terrainTile{
-				gridX:         gx,
-				gridZ:         gz,
-				mesh:          mesh,
-				meshBytes:     meshBytes,
-				material:      mat,
-				texture:       tex,
-				baseTexture:   tex,
-				position:      rl.NewVector3(posX, posY, posZ),
-				worldWest:     worldWest,
-				worldEast:     worldEast,
-				worldSouth:    worldSouth,
-				worldNorth:    worldNorth,
-				centerLocalX:  posX + tileSpanX*0.5,
-				centerLocalZ:  posZ + tileSpanZ*0.5,
-				maxQualityCap: tileQualityExtreme,
+			layouts = append(layouts, terrainTileLayout{
+				gridX:     gx,
+				gridZ:     gz,
+				x0:        x0,
+				x1:        x1,
+				z0:        z0,
+				z1:        z1,
+				tileSpanX: tileSpanX,
+				tileSpanZ: tileSpanZ,
+				posX:      posX,
+				posZ:      posZ,
+				worldWest: t.worldWest + float64(x0)/float64(meshW-1)*(t.worldEast-t.worldWest),
+				worldEast: t.worldWest + float64(x1)/float64(meshW-1)*(t.worldEast-t.worldWest),
+				worldNorth: t.worldNorth -
+					float64(z0)/float64(meshH-1)*(t.worldNorth-t.worldSouth),
+				worldSouth: t.worldNorth -
+					float64(z1)/float64(meshH-1)*(t.worldNorth-t.worldSouth),
 			})
 		}
+	}
+	return layouts
+}
+
+func buildTerrainTiles(t *terrainData, baseMosaic *image.RGBA, gridN int) []*terrainTile {
+	meshW := t.meshWidth
+	meshH := t.meshHeight
+
+	baseW := baseMosaic.Bounds().Dx()
+	baseH := baseMosaic.Bounds().Dy()
+
+	layouts := computeTerrainTileLayouts(t, gridN)
+	tiles := make([]*terrainTile, 0, len(layouts))
+	for _, layout := range layouts {
+		mesh, meshBytes := buildTerrainTileMesh(t, layout.x0, layout.x1, layout.z0, layout.z1, layout.tileSpanX, layout.tileSpanZ)
+
+		bx0 := int(math.Round(float64(layout.x0) / float64(meshW-1) * float64(baseW)))
+		bx1 := int(math.Round(float64(layout.x1) / float64(meshW-1) * float64(baseW)))
+		bz0 := int(math.Round(float64(layout.z0) / float64(meshH-1) * float64(baseH)))
+		bz1 := int(math.Round(float64(layout.z1) / float64(meshH-1) * float64(baseH)))
+		if bx1 <= bx0 {
+			bx1 = bx0 + 1
+		}
+		if bz1 <= bz0 {
+			bz1 = bz0 + 1
+		}
+		if bx1 > baseW {
+			bx1 = baseW
+		}
+		if bz1 > baseH {
+			bz1 = baseH
+		}
+		sub := baseMosaic.SubImage(image.Rect(bx0, bz0, bx1, bz1))
+		tileImg := goImageToRaylibImage(sub)
+		tex := rl.LoadTextureFromImage(tileImg)
+		rl.GenTextureMipmaps(&tex)
+		rl.SetTextureFilter(tex, rl.FilterAnisotropic16x)
+		rl.SetTextureWrap(tex, rl.WrapClamp)
+
+		mat := rl.LoadMaterialDefault()
+		rl.SetMaterialTexture(&mat, rl.MapAlbedo, tex)
+
+		posY := t.position.Y
+
+		tiles = append(tiles, &terrainTile{
+			gridX:         layout.gridX,
+			gridZ:         layout.gridZ,
+			mesh:          mesh,
+			meshBytes:     meshBytes,
+			material:      mat,
+			texture:       tex,
+			baseTexture:   tex,
+			position:      rl.NewVector3(layout.posX, posY, layout.posZ),
+			worldWest:     layout.worldWest,
+			worldEast:     layout.worldEast,
+			worldSouth:    layout.worldSouth,
+			worldNorth:    layout.worldNorth,
+			centerLocalX:  layout.posX + layout.tileSpanX*0.5,
+			centerLocalZ:  layout.posZ + layout.tileSpanZ*0.5,
+			maxQualityCap: tileQualityExtreme,
+		})
 	}
 	return tiles
 }
@@ -273,7 +312,19 @@ func buildTerrainTileMesh(t *terrainData, x0, x1, z0, z1 int, tileSpanX, tileSpa
 
 func drawTerrainTiles(t *terrainData) {
 	for _, tile := range t.tiles {
-		rl.DrawMesh(tile.mesh, tile.material, rl.MatrixTranslate(tile.position.X, tile.position.Y, tile.position.Z))
+		mat := tile.material
+		if t.roadCutShaderValid && tile.roadCutN > 0 && tile.roadCut.ID != 0 {
+			mat.Shader = t.roadCutShader
+			roadCutCount := []float32{float32(tile.roadCutN)}
+			rl.SetShaderValue(t.roadCutShader, t.roadCutCountLoc, roadCutCount, rl.ShaderUniformFloat)
+			segmentMap := mat.GetMap(int32(rl.MapEmission))
+			oldSegments := segmentMap.Texture
+			segmentMap.Texture = tile.roadCut
+			rl.DrawMesh(tile.mesh, mat, rl.MatrixTranslate(tile.position.X, tile.position.Y, tile.position.Z))
+			segmentMap.Texture = oldSegments
+			continue
+		}
+		rl.DrawMesh(tile.mesh, mat, rl.MatrixTranslate(tile.position.X, tile.position.Y, tile.position.Z))
 	}
 }
 
@@ -296,6 +347,11 @@ func unloadTerrainTiles(t *terrainData) {
 		t.streaming = nil
 	}
 	for _, tile := range t.tiles {
+		if tile.roadCut.ID != 0 {
+			rl.UnloadTexture(tile.roadCut)
+			tile.roadCut = rl.Texture2D{}
+			tile.roadCutN = 0
+		}
 		freeTerrainMeshIndexSentinel(tile.mesh.Indices)
 		tile.mesh.Indices = nil
 		rl.UnloadMesh(&tile.mesh)
@@ -308,6 +364,11 @@ func unloadTerrainTiles(t *terrainData) {
 		rl.UnloadMaterial(tile.material)
 	}
 	t.tiles = nil
+	if t.roadCutShaderValid {
+		rl.UnloadShader(t.roadCutShader)
+		t.roadCutShader = rl.Shader{}
+		t.roadCutShaderValid = false
+	}
 }
 
 func startTerrainStreaming(t *terrainData) {
