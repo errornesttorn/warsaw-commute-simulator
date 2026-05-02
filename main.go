@@ -33,6 +33,13 @@ const (
 
 	terrainMeshMaxDim    = 2048
 	terrainTextureMaxDim = 8192
+
+	noSpectatedCarID             = -1
+	fallbackCarFrontPivotFrac    = 0.20
+	carSpectatorForwardOffset    = 0.4
+	carSpectatorLookAhead        = 12.0
+	carSpectatorMinCameraHeight  = 1.1
+	carSpectatorCameraHeightFrac = 0.65
 )
 
 type App struct {
@@ -68,6 +75,7 @@ type App struct {
 	propDirty                  bool
 	propStatus                 string
 	propStatusUntil            float64
+	spectatedCarID             int
 }
 
 type loaderPhase int
@@ -143,6 +151,7 @@ func main() {
 		currentPropScale:     1,
 		currentLinearScale:   1,
 		currentLinearSpacing: defaultLinearSpacingM,
+		spectatedCarID:       noSpectatedCarID,
 	}
 	defer rl.UnloadModel(app.unitCube)
 	defer func() { unloadTerrain(app.terrain) }()
@@ -158,6 +167,13 @@ func main() {
 
 func (a *App) update() {
 	dt := rl.GetFrameTime()
+	shiftDown := rl.IsKeyDown(rl.KeyLeftShift) || rl.IsKeyDown(rl.KeyRightShift)
+	exitedSpectating := false
+
+	if a.spectatedCarID != noSpectatedCarID && shiftDown {
+		a.spectatedCarID = noSpectatedCarID
+		exitedSpectating = true
+	}
 
 	if rl.IsKeyPressed(rl.KeyEscape) {
 		rl.CloseWindow()
@@ -198,11 +214,27 @@ func (a *App) update() {
 	}
 
 	if a.editMode {
+		a.spectatedCarID = noSpectatedCarID
 		a.updatePropEditor()
 	}
 
 	if a.loaded && !a.paused {
 		a.world.Step(dt)
+	}
+
+	if a.loaded && !a.editMode && !exitedSpectating && a.spectatedCarID == noSpectatedCarID && rl.IsMouseButtonPressed(rl.MouseLeftButton) {
+		if carID := a.pickCar(a.buildCamera()); carID != noSpectatedCarID {
+			a.spectatedCarID = carID
+		}
+	}
+
+	if a.spectatedCarID != noSpectatedCarID {
+		if !a.updateSpectatorCamera() {
+			a.spectatedCarID = noSpectatedCarID
+		}
+		pumpTerrainStreaming(a.terrain, a.camPos.X, a.camPos.Z)
+		pumpBuildingStreaming(a.objects, a.camPos.X, a.camPos.Z)
+		return
 	}
 
 	if a.editMode && rl.IsMouseButtonDown(rl.MouseRightButton) {
@@ -234,7 +266,7 @@ func (a *App) update() {
 	right := rl.NewVector3(fwdZ, 0, -fwdX)
 
 	speed := float32(moveSpeed)
-	if rl.IsKeyDown(rl.KeyLeftShift) || rl.IsKeyDown(rl.KeyRightShift) {
+	if shiftDown {
 		speed *= sprintMult
 	}
 
@@ -426,10 +458,7 @@ func (a *App) drawCars() {
 		hx, hz := heading.X, heading.Y
 		angle := float32(math.Atan2(float64(hx), float64(hz))) * 180 / math.Pi
 
-		h := float32(carHeight)
-		if car.VehicleKind == simpkg.VehicleBus {
-			h = busHeight
-		}
+		h := vehicleDrawHeight(car)
 		length := car.Length
 		width := car.Width
 
@@ -488,6 +517,115 @@ func (a *App) drawCars() {
 			}
 		}
 	}
+}
+
+func (a *App) pickCar(camera rl.Camera) int {
+	if !a.loaded || a.world == nil {
+		return noSpectatedCarID
+	}
+	meshes := a.unitCube.GetMeshes()
+	if len(meshes) == 0 {
+		return noSpectatedCarID
+	}
+
+	ray := rl.GetScreenToWorldRay(rl.GetMousePosition(), camera)
+	allSplines := simpkg.MergedSplines(a.world.Splines, a.world.LaneChangeSplines)
+	bestID := noSpectatedCarID
+	bestDist := float32(math.MaxFloat32)
+	for i := range a.world.Cars {
+		car := a.world.Cars[i]
+		_, center, heading, ok := carBodyPose(car, allSplines)
+		if !ok {
+			continue
+		}
+
+		cx, cz := center.X, center.Y
+		hx, hz := heading.X, heading.Y
+		angle := float32(math.Atan2(float64(hx), float64(hz))) * 180 / math.Pi
+		h := vehicleDrawHeight(car)
+		ground := a.groundAt(cx, cz)
+		pitchDeg, rollDeg := a.terrainTilt(cx, cz, hx, hz, car.Length, car.Width)
+		if dist, ok := rayCollisionBoxMesh(ray, meshes[0],
+			rl.NewVector3(cx, ground+h/2, cz),
+			rl.NewVector3(car.Width, h, car.Length),
+			angle, pitchDeg, rollDeg,
+		); ok && dist < bestDist {
+			bestDist = dist
+			bestID = car.ID
+		}
+
+		if car.Trailer.HasTrailer {
+			rearX, rearZ := car.RearPosition.X, car.RearPosition.Y
+			trX, trZ := car.Trailer.RearPosition.X, car.Trailer.RearPosition.Y
+			tdx := rearX - trX
+			tdz := rearZ - trZ
+			trailerAngle := float32(math.Atan2(float64(tdx), float64(tdz))) * 180 / math.Pi
+			thx := float32(math.Sin(float64(trailerAngle) * math.Pi / 180))
+			thz := float32(math.Cos(float64(trailerAngle) * math.Pi / 180))
+			tcx := (rearX + trX) / 2
+			tcz := (rearZ + trZ) / 2
+			tGround := a.groundAt(tcx, tcz)
+			tPitch, tRoll := a.terrainTilt(tcx, tcz, thx, thz, car.Trailer.Length, car.Trailer.Width)
+			if dist, ok := rayCollisionBoxMesh(ray, meshes[0],
+				rl.NewVector3(tcx, tGround+h/2, tcz),
+				rl.NewVector3(car.Trailer.Width, h, car.Trailer.Length),
+				trailerAngle, tPitch, tRoll,
+			); ok && dist < bestDist {
+				bestDist = dist
+				bestID = car.ID
+			}
+		}
+	}
+	return bestID
+}
+
+func (a *App) updateSpectatorCamera() bool {
+	if a.world == nil {
+		return false
+	}
+	allSplines := simpkg.MergedSplines(a.world.Splines, a.world.LaneChangeSplines)
+	for i := range a.world.Cars {
+		car := a.world.Cars[i]
+		if car.ID != a.spectatedCarID {
+			continue
+		}
+		frontPos, _, heading, ok := carBodyPose(car, allSplines)
+		if !ok {
+			return false
+		}
+		frontPivotFrac := car.FrontPivotFrac
+		if frontPivotFrac <= 0 {
+			frontPivotFrac = fallbackCarFrontPivotFrac
+		}
+		h := vehicleDrawHeight(car)
+		cameraHeight := h * carSpectatorCameraHeightFrac
+		if cameraHeight < carSpectatorMinCameraHeight {
+			cameraHeight = carSpectatorMinCameraHeight
+		}
+		forwardOffset := frontPivotFrac*car.Length + carSpectatorForwardOffset
+		camX := frontPos.X + heading.X*forwardOffset
+		camZ := frontPos.Y + heading.Y*forwardOffset
+		lookX := camX + heading.X*carSpectatorLookAhead
+		lookZ := camZ + heading.Y*carSpectatorLookAhead
+
+		a.camPos = rl.NewVector3(camX, a.groundAt(camX, camZ)+cameraHeight, camZ)
+		target := rl.NewVector3(lookX, a.groundAt(lookX, lookZ)+cameraHeight, lookZ)
+		a.lookAt(target)
+		return true
+	}
+	return false
+}
+
+func rayCollisionBoxMesh(ray rl.Ray, mesh rl.Mesh, pos, size rl.Vector3, yawDeg, pitchDeg, rollDeg float32) (float32, bool) {
+	hit := rl.GetRayCollisionMesh(ray, mesh, boxTransform(pos, size, yawDeg, pitchDeg, rollDeg))
+	return hit.Distance, hit.Hit
+}
+
+func vehicleDrawHeight(car simpkg.Car) float32 {
+	if car.VehicleKind == simpkg.VehicleBus {
+		return busHeight
+	}
+	return carHeight
 }
 
 func carBodyPose(car simpkg.Car, splines []simpkg.Spline) (frontPos, center, heading simpkg.Vec2, ok bool) {
@@ -585,13 +723,17 @@ func (a *App) drawHUD() {
 		rl.DrawText(msg, w/2-tw/2, h/2-10, 20, rl.White)
 	}
 
-	cx, cy := w/2, h/2
-	rl.DrawLine(cx-10, cy, cx+10, cy, rl.White)
-	rl.DrawLine(cx, cy-10, cx, cy+10, rl.White)
+	if a.spectatedCarID == noSpectatedCarID {
+		cx, cy := w/2, h/2
+		rl.DrawLine(cx-10, cy, cx+10, cy, rl.White)
+		rl.DrawLine(cx, cy-10, cx, cy+10, rl.White)
+	}
 
-	helpText := "TAB: toggle mouse | Ctrl+O: open | WASD+E/Q: fly | Space: pause | P: paths | F2: props | F3: vram | Shift: sprint"
+	helpText := "TAB: toggle mouse | Ctrl+O: open | WASD+E/Q: fly | LMB car: spectate | Space: pause | P: paths | F2: props | F3: vram | Shift: sprint"
 	if a.editMode {
 		helpText = "PROP EDIT | click asset | 1 prop | 2 select | 3 linear | LMB action | Enter commit line | MMB rotate | ,/. spacing | Ctrl+S save"
+	} else if a.spectatedCarID != noSpectatedCarID {
+		helpText = "SPECTATING CAR | Shift: exit | Ctrl+O: open | Space: pause | P: paths | F3: vram"
 	}
 	rl.DrawText(helpText, 8, h-24, 14, rl.LightGray)
 
@@ -622,6 +764,9 @@ func (a *App) drawHUD() {
 			len(a.world.Cars), len(a.world.Splines), len(a.world.Pedestrians),
 			buildings, residentRegions, totalRegions, inFlightRegions, upgradingRegions, trees, props,
 			a.camPos.X, a.camPos.Y, a.camPos.Z)
+		if a.spectatedCarID != noSpectatedCarID {
+			info += fmt.Sprintf("  Spectating: %d", a.spectatedCarID)
+		}
 		rl.DrawText(info, 8, 8, 16, rl.White)
 	}
 
@@ -653,6 +798,19 @@ func (a *App) drawOrientedBox(pos, size rl.Vector3, yawDeg, pitchDeg, rollDeg fl
 		return
 	}
 
+	meshes := a.unitCube.GetMeshes()
+	materials := a.unitCube.GetMaterials()
+	if len(meshes) == 0 || len(materials) == 0 {
+		return
+	}
+	mapPtr := materials[0].GetMap(int32(rl.MapAlbedo))
+	old := mapPtr.Color
+	mapPtr.Color = tint
+	rl.DrawMesh(meshes[0], materials[0], boxTransform(pos, size, yawDeg, pitchDeg, rollDeg))
+	mapPtr.Color = old
+}
+
+func boxTransform(pos, size rl.Vector3, yawDeg, pitchDeg, rollDeg float32) rl.Matrix {
 	const deg2rad = float32(math.Pi / 180.0)
 	scaleM := rl.MatrixScale(size.X, size.Y, size.Z)
 	rollM := rl.MatrixRotate(rl.NewVector3(0, 0, 1), rollDeg*deg2rad)
@@ -668,17 +826,7 @@ func (a *App) drawOrientedBox(pos, size rl.Vector3, yawDeg, pitchDeg, rollDeg fl
 	m = rl.MatrixMultiply(m, pitchM)
 	m = rl.MatrixMultiply(m, yawM)
 	m = rl.MatrixMultiply(m, transM)
-
-	meshes := a.unitCube.GetMeshes()
-	materials := a.unitCube.GetMaterials()
-	if len(meshes) == 0 || len(materials) == 0 {
-		return
-	}
-	mapPtr := materials[0].GetMap(int32(rl.MapAlbedo))
-	old := mapPtr.Color
-	mapPtr.Color = tint
-	rl.DrawMesh(meshes[0], materials[0], m)
-	mapPtr.Color = old
+	return m
 }
 
 // terrainTilt returns (pitchDeg, rollDeg) so a box centred at (cx,cz) with the
@@ -882,6 +1030,7 @@ func (a *App) installLoadedMap() {
 	a.linearDraft = nil
 	a.draggingProp = false
 	a.propDirty = false
+	a.spectatedCarID = noSpectatedCarID
 
 	if len(problems) > 0 {
 		fmt.Printf("Map loaded, but scene object load had problems: %v\n", errors.Join(problems...))
@@ -912,6 +1061,18 @@ func (a *App) installLoadedMap() {
 
 func (a *App) sim2world(v simpkg.Vec2) rl.Vector3 {
 	return rl.NewVector3(v.X, a.groundAt(v.X, v.Y), v.Y)
+}
+
+func (a *App) lookAt(target rl.Vector3) {
+	dirX := target.X - a.camPos.X
+	dirY := target.Y - a.camPos.Y
+	dirZ := target.Z - a.camPos.Z
+	horizontal := math.Sqrt(float64(dirX*dirX + dirZ*dirZ))
+	if horizontal <= 1e-6 && math.Abs(float64(dirY)) <= 1e-6 {
+		return
+	}
+	a.yaw = float32(math.Atan2(float64(dirX), float64(dirZ)) * 180 / math.Pi)
+	a.pitch = float32(math.Atan2(float64(dirY), horizontal) * 180 / math.Pi)
 }
 
 // groundAt returns the raylib Y height at sim (x, y) — i.e. raylib (x, z).
