@@ -256,7 +256,7 @@ func (a *App) updatePropTransformKeys() {
 }
 
 func (a *App) updatePropMouseRotation() {
-	if !rl.IsMouseButtonDown(rl.MouseMiddleButton) {
+	if !rl.IsMouseButtonDown(rl.MouseRightButton) {
 		return
 	}
 	delta := rl.GetMouseDelta()

@@ -41,11 +41,13 @@ type roadSegment struct {
 }
 
 type roadHeightPolygon struct {
-	ID       int
-	Points   []roadPoint
-	Segments []roadSegment
-	Bounds   roadBounds
-	Area     float32
+	ID         int
+	Points     []roadPoint
+	Segments   []roadSegment
+	Bounds     roadBounds
+	Area       float32
+	SoftFrames []roadSoftSlopeFrame
+	SoftBounds []roadBounds
 }
 
 type roadBounds struct {
@@ -200,6 +202,7 @@ func prepareRoadSurfacesFromPolygons(terrain *terrainData, polygons []roadHeight
 	if len(polygons) == 0 {
 		return &roadSurfaceCPUData{}
 	}
+	polygons = prepareRoadHeightPolygons(polygons)
 
 	layouts := computeTerrainTileLayouts(terrain, terrainTileGridN)
 	cpu := &roadSurfaceCPUData{
@@ -254,7 +257,7 @@ func roadHeightOnlyLayer(cpu *roadSurfaceCPUData) *roadSurfaceLayer {
 	if cpu == nil || len(cpu.HeightPolygons) == 0 {
 		return nil
 	}
-	return &roadSurfaceLayer{HeightPolygons: cpu.HeightPolygons}
+	return &roadSurfaceLayer{HeightPolygons: prepareRoadHeightPolygons(cpu.HeightPolygons)}
 }
 
 func uploadRoadSurfaceLayer(cpu *roadSurfaceCPUData) *roadSurfaceLayer {
@@ -263,7 +266,7 @@ func uploadRoadSurfaceLayer(cpu *roadSurfaceCPUData) *roadSurfaceLayer {
 	}
 
 	layer := &roadSurfaceLayer{
-		HeightPolygons: cpu.HeightPolygons,
+		HeightPolygons: prepareRoadHeightPolygons(cpu.HeightPolygons),
 		HardMaterial:   roadMaterial(color.RGBA{R: 54, G: 54, B: 52, A: 255}),
 	}
 
@@ -476,8 +479,10 @@ func (layer *roadSurfaceLayer) heightAtLocal(localX, localZ, base float32) float
 		if !polygon.Bounds.expanded(roadSoftCurbWidthMeters).contains(p) {
 			continue
 		}
-		distToEdge := roadDistanceToSegments(p, polygon.Segments)
-		insideRoad := pointInRoadPolygon(p, polygon.Points) || distToEdge <= roadGeomEpsilon
+		insideRoad := pointInRoadPolygon(p, polygon.Points)
+		if !insideRoad {
+			insideRoad = roadWithinSegmentDistance(p, polygon.Segments, roadGeomEpsilon)
+		}
 		offset := float32(0)
 		switch {
 		case insideRoad:
@@ -588,7 +593,48 @@ func roadMaskPolygonsFromDoc(doc *roadMaskFile, terrain *terrainData) ([]roadHei
 			Area:     area,
 		})
 	}
-	return polygons, nil
+	return prepareRoadHeightPolygons(polygons), nil
+}
+
+func prepareRoadHeightPolygons(polygons []roadHeightPolygon) []roadHeightPolygon {
+	if len(polygons) == 0 {
+		return polygons
+	}
+	out := make([]roadHeightPolygon, len(polygons))
+	for i, polygon := range polygons {
+		out[i] = prepareRoadHeightPolygon(polygon)
+	}
+	return out
+}
+
+func prepareRoadHeightPolygon(polygon roadHeightPolygon) roadHeightPolygon {
+	if len(polygon.Points) >= 3 {
+		polygon.Bounds = roadPolygonBounds(polygon.Points)
+		polygon.Area = roadPolygonArea(polygon.Points)
+	}
+	if len(polygon.Segments) == 0 {
+		polygon.SoftFrames = nil
+		polygon.SoftBounds = nil
+		return polygon
+	}
+	if len(polygon.SoftFrames) == len(polygon.Segments) && len(polygon.SoftBounds) == len(polygon.Segments) {
+		return polygon
+	}
+	polygon.SoftFrames = make([]roadSoftSlopeFrame, len(polygon.Segments))
+	polygon.SoftBounds = make([]roadBounds, len(polygon.Segments))
+	ccw := polygon.Area > 0
+	for i, segment := range polygon.Segments {
+		if segment.Curb != roadCurbSoft {
+			continue
+		}
+		if frame, ok := roadSoftSlopeFrameForPolygonSegment(polygon, i); ok {
+			polygon.SoftFrames[i] = frame
+		}
+		if strip, ok := roadSoftCurbStripPolygon(segment, ccw); ok {
+			polygon.SoftBounds[i] = roadPolygonBounds(strip).expanded(roadGeomEpsilon)
+		}
+	}
+	return polygon
 }
 
 func roadMaskEdgeIsClosed(edge roadMaskEdge) bool {
@@ -749,7 +795,7 @@ func appendRoadSoftSlopeMeshForTile(terrain *terrainData, layout terrainTileLayo
 		return cutOut
 	}
 	segment := polygon.Segments[segmentIndex]
-	frame, ok := roadSoftSlopeFrameForPolygonSegment(polygon, segmentIndex)
+	frame, ok := roadSoftSlopeFrameForPreparedPolygonSegment(polygon, segmentIndex)
 	if !ok {
 		return cutOut
 	}
@@ -790,7 +836,7 @@ func appendRoadSoftEdgeFillerMeshForTile(terrain *terrainData, layout terrainTil
 		return
 	}
 	segment := polygon.Segments[segmentIndex]
-	frame, ok := roadSoftSlopeFrameForPolygonSegment(polygon, segmentIndex)
+	frame, ok := roadSoftSlopeFrameForPreparedPolygonSegment(polygon, segmentIndex)
 	if !ok {
 		return
 	}
@@ -858,7 +904,7 @@ func roadSoftBandPieceCoveredByOtherRoad(piece roadSegment, ccw bool, polygonInd
 
 func roadPointCoveredByRoadPolygon(p roadPoint, polygon roadHeightPolygon) bool {
 	return polygon.Bounds.expanded(roadGeomEpsilon).contains(p) &&
-		(pointInRoadPolygon(p, polygon.Points) || roadDistanceToSegments(p, polygon.Segments) <= roadGeomEpsilon)
+		(pointInRoadPolygon(p, polygon.Points) || roadWithinSegmentDistance(p, polygon.Segments, roadGeomEpsilon))
 }
 
 func appendRoadSoftSlopeTriangle(terrain *terrainData, layout terrainTileLayout, builder *roadMeshBuilder, frame roadSoftSlopeFrame, a, b, c roadPoint) {
@@ -1004,13 +1050,29 @@ func roadSoftCurbInfluenceAtPoint(p roadPoint, polygon roadHeightPolygon) float3
 		if segment.Curb != roadCurbSoft {
 			continue
 		}
-		frame, ok := roadSoftSlopeFrameForPolygonSegment(polygon, i)
+		if len(polygon.SoftBounds) == len(polygon.Segments) && !polygon.SoftBounds[i].contains(p) {
+			continue
+		}
+		frame, ok := roadSoftSlopeFrameForPreparedPolygonSegment(polygon, i)
 		if !ok {
 			continue
 		}
 		best = max32(best, roadSoftSlopeInfluence(frame, p))
 	}
 	return best
+}
+
+func roadSoftSlopeFrameForPreparedPolygonSegment(polygon roadHeightPolygon, segmentIndex int) (roadSoftSlopeFrame, bool) {
+	if segmentIndex < 0 || segmentIndex >= len(polygon.Segments) {
+		return roadSoftSlopeFrame{}, false
+	}
+	if len(polygon.SoftFrames) == len(polygon.Segments) {
+		frame := polygon.SoftFrames[segmentIndex]
+		if frame.length > roadGeomEpsilon {
+			return frame, true
+		}
+	}
+	return roadSoftSlopeFrameForPolygonSegment(polygon, segmentIndex)
 }
 
 func roadSoftSlopeInfluence(frame roadSoftSlopeFrame, p roadPoint) float32 {
@@ -1054,11 +1116,16 @@ func appendRoadCutSegments(layout terrainTileLayout, polygon []roadPoint, out []
 		if roadPointsNear(a, b) {
 			continue
 		}
+		ay := (a.Z - layout.posZ) / layout.tileSpanZ
+		by := (b.Z - layout.posZ) / layout.tileSpanZ
+		if max32(ay, by) < -roadGeomEpsilon || min32(ay, by) > 1+roadGeomEpsilon {
+			continue
+		}
 		out = append(out,
 			(a.X-layout.posX)/layout.tileSpanX,
-			(a.Z-layout.posZ)/layout.tileSpanZ,
+			ay,
 			(b.X-layout.posX)/layout.tileSpanX,
-			(b.Z-layout.posZ)/layout.tileSpanZ,
+			by,
 		)
 	}
 	return out
@@ -1427,6 +1494,16 @@ func nearestRoadCurb(p roadPoint, segments []roadSegment) (roadCurbType, float32
 func roadDistanceToSegments(p roadPoint, segments []roadSegment) float32 {
 	_, d := nearestRoadCurb(p, segments)
 	return d
+}
+
+func roadWithinSegmentDistance(p roadPoint, segments []roadSegment, maxDistance float32) bool {
+	maxD2 := maxDistance * maxDistance
+	for _, segment := range segments {
+		if roadPointSegmentDistance2(p, segment.A, segment.B) <= maxD2 {
+			return true
+		}
+	}
+	return false
 }
 
 func roadPointSegmentDistance2(p, a, b roadPoint) float32 {

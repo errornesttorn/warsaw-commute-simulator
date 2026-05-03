@@ -480,6 +480,30 @@ func TestAppendRoadCutSegments(t *testing.T) {
 	}
 }
 
+func TestAppendRoadCutSegmentsCullsEdgesOutsideTileY(t *testing.T) {
+	layout := terrainTileLayout{
+		posX:      0,
+		posZ:      0,
+		tileSpanX: 10,
+		tileSpanZ: 10,
+	}
+	polygon := []roadPoint{
+		{X: -10, Z: -10},
+		{X: 20, Z: -10},
+		{X: 20, Z: 20},
+		{X: -10, Z: 20},
+	}
+
+	segments := appendRoadCutSegments(layout, polygon, nil)
+
+	if len(segments) != 2*4 {
+		t.Fatalf("got %d floats, want only vertical crossing edges", len(segments))
+	}
+	if winding := roadCutTestWinding(segments, roadPoint{X: 0.5, Z: 0.5}); winding == 0 {
+		t.Fatal("culled road cut should still classify contained tile points as inside")
+	}
+}
+
 func TestRoadCutSegmentsUseNonzeroWindingForOverlaps(t *testing.T) {
 	layout := terrainTileLayout{
 		posX:      0,

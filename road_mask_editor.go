@@ -352,7 +352,7 @@ func (a *App) drawRoadMaskEditor3D(camera rl.Camera) {
 		rl.DrawSphere(p, roadMaskNodeRadius*1.25, rl.Yellow)
 		rl.DrawSphereWires(p, roadMaskNodeRadius*2.0, 8, 8, rl.NewColor(255, 230, 0, 160))
 	}
-	if hasPos {
+	if hasPos && ed.tool != roadMaskToolEdit {
 		p := a.roadMaskWorldPoint(pos, roadMaskOverlayLift+0.35)
 		rl.DrawSphereWires(p, roadMaskNodeRadius*0.9, 8, 8, rl.White)
 	}

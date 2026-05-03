@@ -59,6 +59,8 @@ type App struct {
 	loader                     *mapLoader
 	showVRAM                   bool
 	editMode                   bool
+	windowedWidth              int
+	windowedHeight             int
 	roadMaskMode               bool
 	roadMaskEditor             *roadMaskEditor
 	roadMaskPreviewPending     bool
@@ -146,7 +148,9 @@ func main() {
 		camPos:               rl.NewVector3(0, 10, 0),
 		pitch:                -20,
 		mouseCaptured:        true,
-		showPaths:            true,
+		showPaths:            false,
+		windowedWidth:        screenW,
+		windowedHeight:       screenH,
 		unitCube:             rl.LoadModelFromMesh(rl.GenMeshCube(1, 1, 1)),
 		selectedProp:         -1,
 		selectedLinearProp:   -1,
@@ -181,6 +185,10 @@ func (a *App) update() {
 
 	if rl.IsKeyPressed(rl.KeyEscape) && !a.roadMaskMode {
 		rl.CloseWindow()
+	}
+
+	if rl.IsKeyPressed(rl.KeyF11) {
+		a.toggleFullscreen()
 	}
 
 	if a.loader != nil {
@@ -247,32 +255,15 @@ func (a *App) update() {
 		if !a.updateSpectatorCamera() {
 			a.spectatedCarID = noSpectatedCarID
 		}
+		if !a.mouseCaptured {
+			a.updateCameraRotation()
+		}
 		pumpTerrainStreaming(a.terrain, a.camPos.X, a.camPos.Z)
 		pumpBuildingStreaming(a.objects, a.camPos.X, a.camPos.Z)
 		return
 	}
 
-	if a.editMode && rl.IsMouseButtonDown(rl.MouseRightButton) {
-		delta := rl.GetMouseDelta()
-		a.yaw -= delta.X * mouseSens
-		a.pitch -= delta.Y * mouseSens
-		if a.pitch > 89 {
-			a.pitch = 89
-		}
-		if a.pitch < -89 {
-			a.pitch = -89
-		}
-	} else if a.mouseCaptured {
-		delta := rl.GetMouseDelta()
-		a.yaw -= delta.X * mouseSens
-		a.pitch -= delta.Y * mouseSens
-		if a.pitch > 89 {
-			a.pitch = 89
-		}
-		if a.pitch < -89 {
-			a.pitch = -89
-		}
-	}
+	a.updateCameraRotation()
 
 	yawRad := float64(a.yaw) * math.Pi / 180.0
 	fwdX := float32(math.Sin(yawRad))
@@ -283,6 +274,9 @@ func (a *App) update() {
 	speed := float32(moveSpeed)
 	if shiftDown {
 		speed *= sprintMult
+	}
+	if a.editMode || a.roadMaskMode {
+		speed *= 0.25
 	}
 
 	if rl.IsKeyDown(rl.KeyW) {
@@ -747,13 +741,13 @@ func (a *App) drawHUD() {
 		rl.DrawLine(cx, cy-10, cx, cy+10, rl.White)
 	}
 
-	helpText := "TAB: toggle mouse | Ctrl+O: open | WASD+E/Q: fly | LMB car: spectate | Space: pause | P: paths | F2: props | F3: vram | Shift: sprint"
+	helpText := "TAB: toggle mouse | Ctrl+O: open | WASD+E/Q: fly | LMB car: spectate | Space: pause | P: traffic geometry | F2: props | F3: vram | F11: fullscreen | Shift: sprint"
 	if a.roadMaskMode && a.roadMaskEditor != nil {
 		helpText = a.roadMaskEditor.helpText()
 	} else if a.editMode {
-		helpText = "PROP EDIT | click asset | 1 prop | 2 select | 3 linear | LMB action | Enter commit line | MMB rotate | ,/. spacing | Ctrl+S save"
+		helpText = "PROP EDIT | click asset | 1 prop | 2 select | 3 linear | LMB action | RMB drag rotate | [/]/R rotate | ,/. spacing | Ctrl+S save"
 	} else if a.spectatedCarID != noSpectatedCarID {
-		helpText = "SPECTATING CAR | Shift: exit | Ctrl+O: open | Space: pause | P: paths | F3: vram"
+		helpText = "SPECTATING CAR | Shift: exit | Ctrl+O: open | Space: pause | P: traffic geometry | F3: vram | F11: fullscreen"
 	}
 	rl.DrawText(helpText, 8, h-24, 14, rl.LightGray)
 
@@ -795,7 +789,7 @@ func (a *App) drawHUD() {
 	} else if a.editMode {
 		a.drawPropEditorHUD(w, h)
 	} else if !a.mouseCaptured {
-		msg := "MOUSE RELEASED - press TAB to recapture"
+		msg := "MOUSE RELEASED - press TAB to recapture | MMB drag to rotate"
 		rl.DrawText(msg, w/2-int32(rl.MeasureText(msg, 16))/2, 8, 16, rl.Orange)
 	}
 
@@ -816,6 +810,39 @@ func (a *App) applyMouseCapture() {
 	} else {
 		rl.EnableCursor()
 	}
+}
+
+func (a *App) updateCameraRotation() {
+	if !a.mouseCaptured && !rl.IsMouseButtonDown(rl.MouseMiddleButton) {
+		return
+	}
+	delta := rl.GetMouseDelta()
+	a.yaw -= delta.X * mouseSens
+	a.pitch -= delta.Y * mouseSens
+	if a.pitch > 89 {
+		a.pitch = 89
+	}
+	if a.pitch < -89 {
+		a.pitch = -89
+	}
+}
+
+func (a *App) toggleFullscreen() {
+	if rl.IsWindowFullscreen() {
+		rl.ToggleFullscreen()
+		if a.windowedWidth <= 0 || a.windowedHeight <= 0 {
+			a.windowedWidth = screenW
+			a.windowedHeight = screenH
+		}
+		rl.SetWindowSize(a.windowedWidth, a.windowedHeight)
+	} else {
+		a.windowedWidth = rl.GetScreenWidth()
+		a.windowedHeight = rl.GetScreenHeight()
+		monitor := rl.GetCurrentMonitor()
+		rl.SetWindowSize(rl.GetMonitorWidth(monitor), rl.GetMonitorHeight(monitor))
+		rl.ToggleFullscreen()
+	}
+	a.applyMouseCapture()
 }
 
 // drawOrientedBox draws the unit cube with yaw + pitch + roll (degrees).
