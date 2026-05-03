@@ -416,8 +416,8 @@ func unloadRoadMesh(mesh *roadMesh) {
 	}
 }
 
-func drawTerrainWithRoadCuts(t *terrainData) {
-	drawTerrainTiles(t)
+func drawTerrainWithRoadCuts(t *terrainData, camera rl.Camera) {
+	drawTerrainTiles(t, camera)
 }
 
 func drawRoadSurfaceLayer(t *terrainData) {

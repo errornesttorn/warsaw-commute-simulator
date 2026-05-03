@@ -57,6 +57,7 @@ type terrainTile struct {
 
 	worldWest, worldEast, worldSouth, worldNorth float64
 	centerLocalX, centerLocalZ                   float32
+	cullRadius                                   float32
 
 	quality       int
 	maxQualityCap int // highest quality tier that has not failed to upload
@@ -187,6 +188,7 @@ func buildTerrainTiles(t *terrainData, baseMosaic *image.RGBA, gridN int) []*ter
 		rl.SetMaterialTexture(&mat, rl.MapAlbedo, tex)
 
 		posY := t.position.Y
+		cullRadius := float32(math.Sqrt(float64(layout.tileSpanX*layout.tileSpanX+layout.tileSpanZ*layout.tileSpanZ+t.heightMeters*t.heightMeters))) * 0.5
 
 		tiles = append(tiles, &terrainTile{
 			gridX:         layout.gridX,
@@ -203,6 +205,7 @@ func buildTerrainTiles(t *terrainData, baseMosaic *image.RGBA, gridN int) []*ter
 			worldNorth:    layout.worldNorth,
 			centerLocalX:  layout.posX + layout.tileSpanX*0.5,
 			centerLocalZ:  layout.posZ + layout.tileSpanZ*0.5,
+			cullRadius:    cullRadius,
 			maxQualityCap: tileQualityExtreme,
 		})
 	}
@@ -310,8 +313,13 @@ func buildTerrainTileMesh(t *terrainData, x0, x1, z0, z1 int, tileSpanX, tileSpa
 	return mesh, meshBytes
 }
 
-func drawTerrainTiles(t *terrainData) {
+func drawTerrainTiles(t *terrainData, camera rl.Camera) {
+	view := newCameraVisibility(camera, float32(rl.GetScreenWidth())/float32(rl.GetScreenHeight()), cameraFar)
 	for _, tile := range t.tiles {
+		center := rl.NewVector3(tile.centerLocalX, t.position.Y+t.heightMeters*0.5, tile.centerLocalZ)
+		if !view.sphereVisible(center, tile.cullRadius) {
+			continue
+		}
 		mat := tile.material
 		if t.roadCutShaderValid && tile.roadCutN > 0 && tile.roadCut.ID != 0 {
 			mat.Shader = t.roadCutShader

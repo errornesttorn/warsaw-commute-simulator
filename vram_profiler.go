@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"sync"
+	"time"
 
 	rl "github.com/gen2brain/raylib-go/raylib"
 )
@@ -31,6 +33,86 @@ type vramReport struct {
 	buildingMedCount  int // regions at buildingQualityMed
 	buildingFullCount int // regions at buildingQualityFull
 	buildingTexAvgW   int32
+	foliageChunkCount int
+}
+
+type cpuStepTiming struct {
+	Name string
+	Last time.Duration
+	Avg  time.Duration
+	Max  time.Duration
+}
+
+type cpuProfiler struct {
+	mu    sync.Mutex
+	steps map[string]*cpuStepTiming
+}
+
+var cpuProfilerDisplayOrder = []string{
+	"update total",
+	"simulation step",
+	"spectator camera",
+	"terrain streaming",
+	"building streaming",
+	"pick car",
+	"prop editor update",
+	"road editor update",
+	"draw CPU total",
+	"draw terrain",
+	"draw roads",
+	"draw scene objects",
+	"draw traffic lights",
+	"draw cars",
+	"draw pedestrians",
+	"draw prop editor",
+	"draw road editor",
+}
+
+func (p *cpuProfiler) record(name string, elapsed time.Duration) {
+	if elapsed < 0 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.steps == nil {
+		p.steps = make(map[string]*cpuStepTiming)
+	}
+	step := p.steps[name]
+	if step == nil {
+		step = &cpuStepTiming{Name: name}
+		p.steps[name] = step
+	}
+	step.Last = elapsed
+	if step.Avg == 0 {
+		step.Avg = elapsed
+	} else {
+		step.Avg = time.Duration(float64(step.Avg)*0.88 + float64(elapsed)*0.12)
+	}
+	if elapsed > step.Max {
+		step.Max = elapsed
+	}
+}
+
+func (p *cpuProfiler) snapshot() []cpuStepTiming {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]cpuStepTiming, 0, len(cpuProfilerDisplayOrder))
+	for _, name := range cpuProfilerDisplayOrder {
+		if step := p.steps[name]; step != nil {
+			out = append(out, *step)
+		}
+	}
+	return out
+}
+
+func formatDuration(d time.Duration) string {
+	if d >= time.Second {
+		return fmt.Sprintf("%.0fms", float64(d)/float64(time.Millisecond))
+	}
+	if d >= time.Millisecond {
+		return fmt.Sprintf("%.2fms", float64(d)/float64(time.Millisecond))
+	}
+	return fmt.Sprintf("%.0fus", float64(d)/float64(time.Microsecond))
 }
 
 func textureBytes(tex rl.Texture2D) int64 {
@@ -156,7 +238,14 @@ func collectVRAM(a *App) vramReport {
 		}
 		if a.objects.TreeFoliage.Loaded {
 			r.foliageTex += textureBytes(a.objects.TreeFoliage.Texture)
-			r.foliageMesh += meshBytes(a.objects.TreeFoliage.Mesh)
+			r.foliageChunkCount = len(a.objects.TreeFoliage.Chunks)
+			for _, chunk := range a.objects.TreeFoliage.Chunks {
+				if chunk.MeshBytes > 0 {
+					r.foliageMesh += chunk.MeshBytes
+				} else {
+					r.foliageMesh += meshBytes(chunk.Mesh)
+				}
+			}
 		}
 	}
 	return r
@@ -182,6 +271,7 @@ func formatBytes(b int64) string {
 
 func drawVRAMProfiler(a *App) {
 	r := collectVRAM(a)
+	cpu := a.profiler.snapshot()
 
 	terrainTotal := r.terrainTextures + r.terrainMeshes + r.roadCutTex + r.roadMeshes
 	buildingTotal := r.buildingTex + r.buildingMeshes
@@ -199,7 +289,20 @@ func drawVRAMProfiler(a *App) {
 	}
 
 	lines := []string{
-		"VRAM profiler  (F3 to toggle)",
+		"Profiler  (F3 to toggle)",
+		"",
+		"CPU timings                 last      avg      max",
+	}
+	for _, step := range cpu {
+		lines = append(lines, fmt.Sprintf("  %-24s %7s %7s %7s",
+			step.Name,
+			formatDuration(step.Last),
+			formatDuration(step.Avg),
+			formatDuration(step.Max),
+		))
+	}
+	lines = append(lines,
+		"",
 		fmt.Sprintf("Total estimate:           %s", formatBytes(grand)),
 		"",
 		fmt.Sprintf("Terrain tiles (%d):       %s", r.terrainTileCount, formatBytes(terrainTotal)),
@@ -219,12 +322,12 @@ func drawVRAMProfiler(a *App) {
 		"",
 		fmt.Sprintf("Foliage:                  %s", formatBytes(foliageTotal)),
 		fmt.Sprintf("  texture:                %s", formatBytes(r.foliageTex)),
-		fmt.Sprintf("  mesh:                   %s", formatBytes(r.foliageMesh)),
-	}
+		fmt.Sprintf("  meshes (%d):             %s", r.foliageChunkCount, formatBytes(r.foliageMesh)),
+	)
 
 	const (
-		fontSize = 14
-		lineH    = 18
+		fontSize = 13
+		lineH    = 16
 		padding  = 8
 	)
 	maxW := int32(0)

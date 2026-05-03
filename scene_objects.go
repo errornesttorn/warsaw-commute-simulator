@@ -31,6 +31,7 @@ type sceneObjects struct {
 	LinearProps     []linearPropInstance
 	PropAssets      map[string]*propAsset
 	streaming       *buildingStreaming
+	visibleTrees    []visibleTreeDraw
 }
 
 type buildingRegion struct {
@@ -120,11 +121,19 @@ type buildingRegionUpload struct {
 
 type treeFoliageResources struct {
 	Texture     rl.Texture2D
-	Mesh        rl.Mesh
 	Material    rl.Material
 	Shader      rl.Shader
 	ShaderValid bool
 	Loaded      bool
+	Chunks      []treeFoliageChunk
+}
+
+type treeFoliageChunk struct {
+	Mesh      rl.Mesh
+	MeshBytes int64
+	Center    rl.Vector3
+	Radius    float32
+	Trees     []treeInstance
 }
 
 type treeInstance struct {
@@ -222,7 +231,9 @@ func unloadSceneObjects(objects *sceneObjects) {
 		objects.BuildingRegions[i].Model = streamedBuildingModel{}
 	}
 	if objects.TreeFoliage.Loaded {
-		rl.UnloadMesh(&objects.TreeFoliage.Mesh)
+		for i := range objects.TreeFoliage.Chunks {
+			rl.UnloadMesh(&objects.TreeFoliage.Chunks[i].Mesh)
+		}
 		// UnloadMaterial unloads both the attached shader and the albedo texture,
 		// so do not unload Texture/Shader explicitly here — that's a double-free.
 		rl.UnloadMaterial(objects.TreeFoliage.Material)
@@ -234,21 +245,44 @@ func drawSceneObjects(camera rl.Camera, terrain *terrainData, objects *sceneObje
 	if objects == nil {
 		return
 	}
+	view := newCameraVisibility(camera, float32(rl.GetScreenWidth())/float32(rl.GetScreenHeight()), cameraFar)
 	for i := range objects.BuildingRegions {
 		region := &objects.BuildingRegions[i]
 		if region.State != regionStateLoaded {
+			continue
+		}
+		if !buildingRegionVisible(view, region) {
 			continue
 		}
 		drawStreamedBuildingModel(region.Model, region.Position)
 	}
 	drawProps(terrain, objects)
 
-	visibleTrees := visibleTreesForCamera(camera, objects.Trees)
-	drawTreeTrunks(visibleTrees)
-	drawTreeFoliage(objects.TreeFoliage, visibleTrees)
+	objects.visibleTrees = visibleTreesForCamera(camera, view, objects.Trees, objects.TreeFoliage.Chunks, objects.visibleTrees)
+	drawTreeTrunks(objects.visibleTrees)
+	drawTreeFoliage(objects.TreeFoliage, view, objects.visibleTrees)
 }
 
-func visibleTreesForCamera(camera rl.Camera, trees []treeInstance) []visibleTreeDraw {
+func buildingRegionVisible(view cameraVisibility, region *buildingRegion) bool {
+	if region == nil {
+		return false
+	}
+	center := rl.NewVector3(region.Position.X, view.position.Y, region.Position.Z)
+	radius := float32(80)
+	if region.HasBounds {
+		center.X = (region.BoundsMinX + region.BoundsMaxX) * 0.5
+		center.Z = (region.BoundsMinZ + region.BoundsMaxZ) * 0.5
+		dx := region.BoundsMaxX - region.BoundsMinX
+		dz := region.BoundsMaxZ - region.BoundsMinZ
+		radius = float32(math.Sqrt(float64(dx*dx+dz*dz))) * 0.5
+		if radius < 20 {
+			radius = 20
+		}
+	}
+	return view.sphereVisible(center, radius)
+}
+
+func visibleTreesForCamera(camera rl.Camera, view cameraVisibility, trees []treeInstance, chunks []treeFoliageChunk, reuse []visibleTreeDraw) []visibleTreeDraw {
 	cameraX := camera.Position.X
 	cameraZ := camera.Position.Z
 	treeDrawDistance := float32(650)
@@ -260,7 +294,30 @@ func visibleTreesForCamera(camera rl.Camera, trees []treeInstance) []visibleTree
 	}
 	treeLimit2 := treeDrawDistance * treeDrawDistance
 
-	visibleTrees := make([]visibleTreeDraw, 0, len(trees))
+	visibleTrees := reuse[:0]
+	if len(chunks) > 0 {
+		for _, chunk := range chunks {
+			chunkLimit := treeDrawDistance + chunk.Radius
+			if horizontalDistanceSquared(cameraX, cameraZ, chunk.Center.X, chunk.Center.Z) > chunkLimit*chunkLimit {
+				continue
+			}
+			if !view.sphereVisible(chunk.Center, chunk.Radius) {
+				continue
+			}
+			for _, tree := range chunk.Trees {
+				distance2 := horizontalDistanceSquared(cameraX, cameraZ, tree.X, tree.Z)
+				if distance2 > treeLimit2 {
+					continue
+				}
+				visibleTrees = append(visibleTrees, visibleTreeDraw{
+					Tree:      tree,
+					Distance2: distance2,
+				})
+			}
+		}
+		return visibleTrees
+	}
+
 	for _, tree := range trees {
 		distance2 := horizontalDistanceSquared(cameraX, cameraZ, tree.X, tree.Z)
 		if distance2 > treeLimit2 {
@@ -295,7 +352,7 @@ func drawTreeTrunks(visibleTrees []visibleTreeDraw) {
 	}
 }
 
-func drawTreeFoliage(foliage treeFoliageResources, visibleTrees []visibleTreeDraw) {
+func drawTreeFoliage(foliage treeFoliageResources, view cameraVisibility, visibleTrees []visibleTreeDraw) {
 	if !foliage.Loaded {
 		for _, visible := range visibleTrees {
 			tree := visible.Tree
@@ -317,12 +374,18 @@ func drawTreeFoliage(foliage treeFoliageResources, visibleTrees []visibleTreeDra
 	}
 
 	rl.DisableBackfaceCulling()
-	rl.DrawMesh(foliage.Mesh, foliage.Material, rl.MatrixIdentity())
+	for _, chunk := range foliage.Chunks {
+		if !view.sphereVisible(chunk.Center, chunk.Radius) {
+			continue
+		}
+		rl.DrawMesh(chunk.Mesh, foliage.Material, rl.MatrixIdentity())
+	}
 	rl.EnableBackfaceCulling()
 }
 
 const foliageSpriteSize = 128
 const foliageVariantCount = 10
+const foliageChunkMeters = 180
 
 func buildFoliageAtlas() *image.NRGBA {
 	atlas := image.NewNRGBA(image.Rect(0, 0, foliageSpriteSize*foliageVariantCount, foliageSpriteSize))
@@ -342,8 +405,8 @@ func uploadTreeFoliage(atlas *image.NRGBA, trees []treeInstance) treeFoliageReso
 	rl.SetTextureFilter(texture, rl.FilterTrilinear)
 	rl.SetTextureWrap(texture, rl.WrapClamp)
 
-	mesh := buildTreeFoliageMesh(trees, foliageVariantCount)
-	if mesh.VertexCount == 0 {
+	chunks := buildTreeFoliageChunks(trees, foliageVariantCount)
+	if len(chunks) == 0 {
 		rl.UnloadTexture(texture)
 		return treeFoliageResources{}
 	}
@@ -358,12 +421,69 @@ func uploadTreeFoliage(atlas *image.NRGBA, trees []treeInstance) treeFoliageReso
 
 	return treeFoliageResources{
 		Texture:     texture,
-		Mesh:        mesh,
 		Material:    material,
 		Shader:      shader,
 		ShaderValid: shaderValid,
 		Loaded:      true,
+		Chunks:      chunks,
 	}
+}
+
+func buildTreeFoliageChunks(trees []treeInstance, variantCount int) []treeFoliageChunk {
+	if len(trees) == 0 {
+		return nil
+	}
+	groups := make(map[[2]int][]treeInstance)
+	for _, tree := range trees {
+		key := [2]int{
+			int(math.Floor(float64(tree.X / foliageChunkMeters))),
+			int(math.Floor(float64(tree.Z / foliageChunkMeters))),
+		}
+		groups[key] = append(groups[key], tree)
+	}
+
+	chunks := make([]treeFoliageChunk, 0, len(groups))
+	for _, group := range groups {
+		mesh, meshBytes := buildTreeFoliageMesh(group, variantCount)
+		if mesh.VertexCount == 0 {
+			continue
+		}
+		center, radius := treeChunkBounds(group)
+		chunks = append(chunks, treeFoliageChunk{
+			Mesh:      mesh,
+			MeshBytes: meshBytes,
+			Center:    center,
+			Radius:    radius,
+			Trees:     group,
+		})
+	}
+	return chunks
+}
+
+func treeChunkBounds(trees []treeInstance) (rl.Vector3, float32) {
+	if len(trees) == 0 {
+		return rl.Vector3{}, 0
+	}
+	minX, maxX := trees[0].X-trees[0].CrownRadius, trees[0].X+trees[0].CrownRadius
+	minY, maxY := trees[0].BaseY, trees[0].BaseY+trees[0].Height
+	minZ, maxZ := trees[0].Z-trees[0].CrownRadius, trees[0].Z+trees[0].CrownRadius
+	for _, tree := range trees[1:] {
+		minX = min32(minX, tree.X-tree.CrownRadius)
+		maxX = max32(maxX, tree.X+tree.CrownRadius)
+		minY = min32(minY, tree.BaseY)
+		maxY = max32(maxY, tree.BaseY+tree.Height)
+		minZ = min32(minZ, tree.Z-tree.CrownRadius)
+		maxZ = max32(maxZ, tree.Z+tree.CrownRadius)
+	}
+	center := rl.NewVector3((minX+maxX)*0.5, (minY+maxY)*0.5, (minZ+maxZ)*0.5)
+	dx := maxX - minX
+	dy := maxY - minY
+	dz := maxZ - minZ
+	radius := float32(math.Sqrt(float64(dx*dx+dy*dy+dz*dz))) * 0.5
+	if radius < 10 {
+		radius = 10
+	}
+	return center, radius
 }
 
 // goImageToRaylibImage builds an rl.Image backed by a contiguous RGBA8 buffer.
@@ -521,7 +641,7 @@ func drawGeneratedFoliageSprite(atlas *image.NRGBA, spriteSize int, variant int)
 	}
 }
 
-func buildTreeFoliageMesh(trees []treeInstance, variantCount int) rl.Mesh {
+func buildTreeFoliageMesh(trees []treeInstance, variantCount int) (rl.Mesh, int64) {
 	var vertices []float32
 	var texcoords []float32
 	var colors []uint8
@@ -560,7 +680,7 @@ func buildTreeFoliageMesh(trees []treeInstance, variantCount int) rl.Mesh {
 	}
 
 	if len(vertices) == 0 {
-		return rl.Mesh{}
+		return rl.Mesh{}, 0
 	}
 
 	mesh := rl.Mesh{
@@ -571,7 +691,11 @@ func buildTreeFoliageMesh(trees []treeInstance, variantCount int) rl.Mesh {
 		Colors:        &colors[0],
 	}
 	rl.UploadMesh(&mesh, false)
-	return mesh
+	mesh.Vertices = nil
+	mesh.Texcoords = nil
+	mesh.Colors = nil
+	meshBytes := int64(len(vertices)*4 + len(texcoords)*4 + len(colors))
+	return mesh, meshBytes
 }
 
 func appendFoliageQuad(vertices, texcoords *[]float32, colors *[]uint8, center rl.Vector3, width, height float32, angle float32, variant int, variantCount int, tint rl.Color) {

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	simpkg "github.com/errornesttorn/mini-traffic-simulation-core"
 	rl "github.com/gen2brain/raylib-go/raylib"
@@ -19,6 +20,7 @@ import (
 const (
 	screenW    = 1280
 	screenH    = 720
+	cameraFar  = 2000.0
 	moveSpeed  = 40.0
 	sprintMult = 6.0
 	mouseSens  = 0.2
@@ -58,6 +60,7 @@ type App struct {
 	unitCube                   rl.Model
 	loader                     *mapLoader
 	showVRAM                   bool
+	profiler                   cpuProfiler
 	editMode                   bool
 	windowedWidth              int
 	windowedHeight             int
@@ -166,7 +169,9 @@ func main() {
 	defer func() { unloadSceneObjects(app.objects) }()
 
 	for !rl.WindowShouldClose() {
+		stepStart := time.Now()
 		app.update()
+		app.profiler.record("update total", time.Since(stepStart))
 		app.draw()
 	}
 }
@@ -192,7 +197,9 @@ func (a *App) update() {
 	}
 
 	if a.loader != nil {
+		stepStart := time.Now()
 		a.advanceLoader()
+		a.profiler.record("loader pump", time.Since(stepStart))
 		return
 	}
 
@@ -233,36 +240,51 @@ func (a *App) update() {
 
 	if a.editMode {
 		a.spectatedCarID = noSpectatedCarID
+		stepStart := time.Now()
 		a.updatePropEditor()
+		a.profiler.record("prop editor update", time.Since(stepStart))
 	}
 
 	if a.roadMaskMode {
 		a.spectatedCarID = noSpectatedCarID
+		stepStart := time.Now()
 		a.updateRoadMaskEditor()
+		a.profiler.record("road editor update", time.Since(stepStart))
 	}
 
 	if a.loaded && !a.paused {
+		stepStart := time.Now()
 		a.world.Step(dt)
+		a.profiler.record("simulation step", time.Since(stepStart))
 	}
 
 	if a.loaded && !a.editMode && !a.roadMaskMode && !exitedSpectating && a.spectatedCarID == noSpectatedCarID && rl.IsMouseButtonPressed(rl.MouseLeftButton) {
+		stepStart := time.Now()
 		if carID := a.pickCar(a.buildCamera()); carID != noSpectatedCarID {
 			a.spectatedCarID = carID
 		}
+		a.profiler.record("pick car", time.Since(stepStart))
 	}
 
 	if a.spectatedCarID != noSpectatedCarID {
+		stepStart := time.Now()
 		if !a.updateSpectatorCamera() {
 			a.spectatedCarID = noSpectatedCarID
 		}
+		a.profiler.record("spectator camera", time.Since(stepStart))
 		if !a.mouseCaptured {
 			a.updateCameraRotation()
 		}
+		stepStart = time.Now()
 		pumpTerrainStreaming(a.terrain, a.camPos.X, a.camPos.Z)
+		a.profiler.record("terrain streaming", time.Since(stepStart))
+		stepStart = time.Now()
 		pumpBuildingStreaming(a.objects, a.camPos.X, a.camPos.Z)
+		a.profiler.record("building streaming", time.Since(stepStart))
 		return
 	}
 
+	stepStart := time.Now()
 	a.updateCameraRotation()
 
 	yawRad := float64(a.yaw) * math.Pi / 180.0
@@ -299,31 +321,48 @@ func (a *App) update() {
 		a.camPos.Y -= speed * dt
 	}
 
+	stepStart = time.Now()
 	pumpTerrainStreaming(a.terrain, a.camPos.X, a.camPos.Z)
+	a.profiler.record("terrain streaming", time.Since(stepStart))
+	stepStart = time.Now()
 	pumpBuildingStreaming(a.objects, a.camPos.X, a.camPos.Z)
+	a.profiler.record("building streaming", time.Since(stepStart))
 }
 
 // ---------- draw ----------
 
 func (a *App) draw() {
+	drawCPUStart := time.Now()
+	stepStart := time.Now()
 	rl.BeginDrawing()
 	rl.ClearBackground(rl.NewColor(170, 208, 253, 255))
 
 	if a.loader != nil {
+		stepStart = time.Now()
 		a.drawLoadingScreen()
+		a.profiler.record("draw loading", time.Since(stepStart))
+		a.profiler.record("draw CPU total", time.Since(drawCPUStart))
 		rl.EndDrawing()
 		return
 	}
 
 	camera := a.buildCamera()
-	rl.SetClipPlanes(0.01, 2000.0)
+	rl.SetClipPlanes(0.01, cameraFar)
 	rl.BeginMode3D(camera)
 	if a.terrain != nil {
-		drawTerrainWithRoadCuts(a.terrain)
+		stepStart = time.Now()
+		drawTerrainWithRoadCuts(a.terrain, camera)
+		a.profiler.record("draw terrain", time.Since(stepStart))
+		stepStart = time.Now()
 		drawRoadSurfaceLayer(a.terrain)
+		a.profiler.record("draw roads", time.Since(stepStart))
+		stepStart = time.Now()
 		drawSceneObjects(camera, a.terrain, a.objects)
+		a.profiler.record("draw scene objects", time.Since(stepStart))
 	} else {
+		stepStart = time.Now()
 		rl.DrawGrid(200, 1.0)
+		a.profiler.record("draw grid", time.Since(stepStart))
 	}
 
 	if a.loaded {
@@ -331,19 +370,32 @@ func (a *App) draw() {
 			a.drawPedestrianPaths()
 			a.drawSplines()
 		}
+		stepStart = time.Now()
 		a.drawTrafficLights()
+		a.profiler.record("draw traffic lights", time.Since(stepStart))
+		stepStart = time.Now()
 		a.drawCars()
+		a.profiler.record("draw cars", time.Since(stepStart))
+		stepStart = time.Now()
 		a.drawPedestrians()
+		a.profiler.record("draw pedestrians", time.Since(stepStart))
 	}
 	if a.editMode {
+		stepStart = time.Now()
 		a.drawPropEditor3D(camera)
+		a.profiler.record("draw prop editor", time.Since(stepStart))
 	}
 	if a.roadMaskMode {
+		stepStart = time.Now()
 		a.drawRoadMaskEditor3D(camera)
+		a.profiler.record("draw road editor", time.Since(stepStart))
 	}
 
+	stepStart = time.Now()
 	rl.EndMode3D()
+	a.profiler.record("draw end 3d", time.Since(stepStart))
 	a.drawHUD()
+	a.profiler.record("draw CPU total", time.Since(drawCPUStart))
 	rl.EndDrawing()
 }
 
