@@ -116,11 +116,33 @@ type roadSoftSlopeFrame struct {
 }
 
 type roadMaskFile struct {
-	Geotiff struct {
-		GeoTransform [6]float64 `json:"geo_transform"`
-	} `json:"geotiff"`
-	Nodes []roadMaskNode `json:"nodes"`
-	Edges []roadMaskEdge `json:"edges"`
+	Geotiff roadMaskGeoTIFF `json:"geotiff"`
+	Nodes   []roadMaskNode  `json:"nodes"`
+	Edges   []roadMaskEdge  `json:"edges"`
+}
+
+type roadMaskGeoTIFF struct {
+	SourcePath   string           `json:"source_path,omitempty"`
+	SourceFile   string           `json:"source_file,omitempty"`
+	Width        int              `json:"width,omitempty"`
+	Height       int              `json:"height,omitempty"`
+	GeoTransform [6]float64       `json:"geo_transform"`
+	CRS          *roadMaskCRS     `json:"crs,omitempty"`
+	Corners      *roadMaskCorners `json:"corners,omitempty"`
+	PixelCoords  string           `json:"pixel_coords,omitempty"`
+}
+
+type roadMaskCRS struct {
+	WKT                      string `json:"wkt,omitempty"`
+	DataAxisToSRSAxisMapping []int  `json:"data_axis_to_srs_axis_mapping,omitempty"`
+}
+
+type roadMaskCorners struct {
+	UpperLeft  []float64 `json:"upper_left,omitempty"`
+	LowerLeft  []float64 `json:"lower_left,omitempty"`
+	LowerRight []float64 `json:"lower_right,omitempty"`
+	UpperRight []float64 `json:"upper_right,omitempty"`
+	Center     []float64 `json:"center,omitempty"`
 }
 
 type roadMaskNode struct {
@@ -130,9 +152,11 @@ type roadMaskNode struct {
 }
 
 type roadMaskEdge struct {
-	ID      int           `json:"id"`
-	NodeIDs []int         `json:"node_ids"`
-	Segs    []roadMaskSeg `json:"segs"`
+	ID             int           `json:"id"`
+	NodeIDs        []int         `json:"node_ids"`
+	Segs           []roadMaskSeg `json:"segs"`
+	LegacyCurb     string        `json:"curb,omitempty"`
+	LegacyIsSpline *bool         `json:"is_spline,omitempty"`
 }
 
 type roadMaskSeg struct {
@@ -143,22 +167,38 @@ type roadMaskSeg struct {
 }
 
 func prepareRoadSurfacesCPU(mapDef *mapDefinition, terrain *terrainData) (*roadSurfaceCPUData, []error) {
-	if mapDef == nil || terrain == nil || len(mapDef.RoadMaskPaths) == 0 {
+	if mapDef == nil || terrain == nil || mapDef.RoadMaskPath == "" {
 		return nil, nil
 	}
 
 	var problems []error
-	var polygons []roadHeightPolygon
-	for _, path := range mapDef.RoadMaskPaths {
-		filePolys, err := loadRoadMaskPolygons(path, terrain)
-		if err != nil {
-			problems = append(problems, fmt.Errorf("%s: %w", filepath.Base(path), err))
-			continue
+	polygons, err := loadRoadMaskPolygons(mapDef.RoadMaskPath, terrain)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return &roadSurfaceCPUData{}, nil
 		}
-		polygons = append(polygons, filePolys...)
+		problems = append(problems, fmt.Errorf("%s: %w", filepath.Base(mapDef.RoadMaskPath), err))
+	}
+	return prepareRoadSurfacesFromPolygons(terrain, polygons), problems
+}
+
+func prepareRoadSurfacesFromMaskFile(doc *roadMaskFile, terrain *terrainData) (*roadSurfaceCPUData, []error) {
+	if doc == nil || terrain == nil {
+		return nil, nil
+	}
+	polygons, err := roadMaskPolygonsFromDoc(doc, terrain)
+	if err != nil {
+		return &roadSurfaceCPUData{}, []error{err}
+	}
+	return prepareRoadSurfacesFromPolygons(terrain, polygons), nil
+}
+
+func prepareRoadSurfacesFromPolygons(terrain *terrainData, polygons []roadHeightPolygon) *roadSurfaceCPUData {
+	if terrain == nil {
+		return nil
 	}
 	if len(polygons) == 0 {
-		return &roadSurfaceCPUData{}, problems
+		return &roadSurfaceCPUData{}
 	}
 
 	layouts := computeTerrainTileLayouts(terrain, terrainTileGridN)
@@ -207,7 +247,7 @@ func prepareRoadSurfacesCPU(mapDef *mapDefinition, terrain *terrainData) (*roadS
 			Segments:  append([]float32(nil), segments...),
 		})
 	}
-	return cpu, problems
+	return cpu
 }
 
 func roadHeightOnlyLayer(cpu *roadSurfaceCPUData) *roadSurfaceLayer {
@@ -276,6 +316,37 @@ func uploadRoadCutSegments(terrain *terrainData, cpu *roadSurfaceCPUData) {
 		rl.SetTextureWrap(tex, rl.WrapClamp)
 		terrain.tiles[cut.TileIndex].roadCut = tex
 		terrain.tiles[cut.TileIndex].roadCutN = segmentCount
+	}
+}
+
+func replaceRoadSurfaceLayer(terrain *terrainData, cpu *roadSurfaceCPUData) {
+	if terrain == nil {
+		return
+	}
+	unloadRoadSurfaceLayer(terrain.roads)
+	terrain.roads = uploadRoadSurfaceLayer(cpu)
+	clearRoadCutSegments(terrain)
+	if cpu == nil || len(cpu.Cuts) == 0 {
+		return
+	}
+	if !terrain.roadCutShaderValid {
+		terrain.roadCutShader, terrain.roadCutCountLoc, terrain.roadCutShaderValid = loadTerrainRoadCutShader()
+	}
+	if terrain.roadCutShaderValid {
+		uploadRoadCutSegments(terrain, cpu)
+	}
+}
+
+func clearRoadCutSegments(terrain *terrainData) {
+	if terrain == nil {
+		return
+	}
+	for _, tile := range terrain.tiles {
+		if tile.roadCut.ID != 0 {
+			rl.UnloadTexture(tile.roadCut)
+			tile.roadCut = rl.Texture2D{}
+		}
+		tile.roadCutN = 0
 	}
 }
 
@@ -441,6 +512,13 @@ func loadRoadMaskPolygons(path string, terrain *terrainData) ([]roadHeightPolygo
 	if err := json.NewDecoder(file).Decode(&doc); err != nil {
 		return nil, fmt.Errorf("decode road mask: %w", err)
 	}
+	return roadMaskPolygonsFromDoc(&doc, terrain)
+}
+
+func roadMaskPolygonsFromDoc(doc *roadMaskFile, terrain *terrainData) ([]roadHeightPolygon, error) {
+	if doc == nil {
+		return nil, nil
+	}
 	if doc.Geotiff.GeoTransform[1] == 0 && doc.Geotiff.GeoTransform[5] == 0 {
 		return nil, errors.New("missing geotiff.geo_transform")
 	}
@@ -452,16 +530,17 @@ func loadRoadMaskPolygons(path string, terrain *terrainData) ([]roadHeightPolygo
 
 	polygons := make([]roadHeightPolygon, 0, len(doc.Edges))
 	for _, edge := range doc.Edges {
-		if len(edge.NodeIDs) < 4 {
-			return nil, fmt.Errorf("edge %d needs at least 4 node ids", edge.ID)
+		if !roadMaskEdgeIsClosed(edge) {
+			continue
 		}
-		if len(edge.Segs) != len(edge.NodeIDs)-1 {
-			return nil, fmt.Errorf("edge %d has %d segments for %d node ids", edge.ID, len(edge.Segs), len(edge.NodeIDs))
+		segs := roadMaskEdgeSegments(edge)
+		if len(segs) != len(edge.NodeIDs)-1 {
+			return nil, fmt.Errorf("edge %d has %d segments for %d node ids", edge.ID, len(segs), len(edge.NodeIDs))
 		}
 
 		var points []roadPoint
 		var segments []roadSegment
-		for i, seg := range edge.Segs {
+		for i, seg := range segs {
 			aNode, ok := nodes[edge.NodeIDs[i]]
 			if !ok {
 				return nil, fmt.Errorf("edge %d references missing node %d", edge.ID, edge.NodeIDs[i])
@@ -510,6 +589,27 @@ func loadRoadMaskPolygons(path string, terrain *terrainData) ([]roadHeightPolygo
 		})
 	}
 	return polygons, nil
+}
+
+func roadMaskEdgeIsClosed(edge roadMaskEdge) bool {
+	return len(edge.NodeIDs) >= 4 && edge.NodeIDs[0] == edge.NodeIDs[len(edge.NodeIDs)-1]
+}
+
+func roadMaskEdgeSegments(edge roadMaskEdge) []roadMaskSeg {
+	if len(edge.Segs) > 0 {
+		return edge.Segs
+	}
+	n := len(edge.NodeIDs) - 1
+	if n < 0 {
+		n = 0
+	}
+	curb := edge.LegacyCurb
+	isSpline := edge.LegacyIsSpline != nil && *edge.LegacyIsSpline
+	segs := make([]roadMaskSeg, n)
+	for i := range segs {
+		segs[i] = roadMaskSeg{IsSpline: isSpline, Curb: curb}
+	}
+	return segs
 }
 
 func parseRoadCurbType(value string) (roadCurbType, error) {

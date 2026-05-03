@@ -59,6 +59,10 @@ type App struct {
 	loader                     *mapLoader
 	showVRAM                   bool
 	editMode                   bool
+	roadMaskMode               bool
+	roadMaskEditor             *roadMaskEditor
+	roadMaskPreviewPending     bool
+	roadMaskLastPreviewAt      float64
 	propTool                   propEditTool
 	selectedProp               int
 	selectedLinearProp         int
@@ -175,7 +179,7 @@ func (a *App) update() {
 		exitedSpectating = true
 	}
 
-	if rl.IsKeyPressed(rl.KeyEscape) {
+	if rl.IsKeyPressed(rl.KeyEscape) && !a.roadMaskMode {
 		rl.CloseWindow()
 	}
 
@@ -186,11 +190,7 @@ func (a *App) update() {
 
 	if rl.IsKeyPressed(rl.KeyTab) && !a.editMode {
 		a.mouseCaptured = !a.mouseCaptured
-		if a.mouseCaptured {
-			rl.DisableCursor()
-		} else {
-			rl.EnableCursor()
-		}
+		a.applyMouseCapture()
 	}
 
 	if (rl.IsKeyDown(rl.KeyLeftControl) || rl.IsKeyDown(rl.KeyRightControl)) && rl.IsKeyPressed(rl.KeyO) {
@@ -210,7 +210,17 @@ func (a *App) update() {
 	}
 
 	if rl.IsKeyPressed(rl.KeyF2) {
+		if a.roadMaskMode {
+			a.toggleRoadMaskEditor()
+		}
 		a.togglePropEditor()
+	}
+
+	if rl.IsKeyPressed(rl.KeyF4) {
+		if a.editMode {
+			a.togglePropEditor()
+		}
+		a.toggleRoadMaskEditor()
 	}
 
 	if a.editMode {
@@ -218,11 +228,16 @@ func (a *App) update() {
 		a.updatePropEditor()
 	}
 
+	if a.roadMaskMode {
+		a.spectatedCarID = noSpectatedCarID
+		a.updateRoadMaskEditor()
+	}
+
 	if a.loaded && !a.paused {
 		a.world.Step(dt)
 	}
 
-	if a.loaded && !a.editMode && !exitedSpectating && a.spectatedCarID == noSpectatedCarID && rl.IsMouseButtonPressed(rl.MouseLeftButton) {
+	if a.loaded && !a.editMode && !a.roadMaskMode && !exitedSpectating && a.spectatedCarID == noSpectatedCarID && rl.IsMouseButtonPressed(rl.MouseLeftButton) {
 		if carID := a.pickCar(a.buildCamera()); carID != noSpectatedCarID {
 			a.spectatedCarID = carID
 		}
@@ -328,6 +343,9 @@ func (a *App) draw() {
 	}
 	if a.editMode {
 		a.drawPropEditor3D(camera)
+	}
+	if a.roadMaskMode {
+		a.drawRoadMaskEditor3D(camera)
 	}
 
 	rl.EndMode3D()
@@ -723,14 +741,16 @@ func (a *App) drawHUD() {
 		rl.DrawText(msg, w/2-tw/2, h/2-10, 20, rl.White)
 	}
 
-	if a.spectatedCarID == noSpectatedCarID {
+	if a.spectatedCarID == noSpectatedCarID && a.mouseCaptured {
 		cx, cy := w/2, h/2
 		rl.DrawLine(cx-10, cy, cx+10, cy, rl.White)
 		rl.DrawLine(cx, cy-10, cx, cy+10, rl.White)
 	}
 
 	helpText := "TAB: toggle mouse | Ctrl+O: open | WASD+E/Q: fly | LMB car: spectate | Space: pause | P: paths | F2: props | F3: vram | Shift: sprint"
-	if a.editMode {
+	if a.roadMaskMode && a.roadMaskEditor != nil {
+		helpText = a.roadMaskEditor.helpText()
+	} else if a.editMode {
 		helpText = "PROP EDIT | click asset | 1 prop | 2 select | 3 linear | LMB action | Enter commit line | MMB rotate | ,/. spacing | Ctrl+S save"
 	} else if a.spectatedCarID != noSpectatedCarID {
 		helpText = "SPECTATING CAR | Shift: exit | Ctrl+O: open | Space: pause | P: paths | F3: vram"
@@ -770,7 +790,9 @@ func (a *App) drawHUD() {
 		rl.DrawText(info, 8, 8, 16, rl.White)
 	}
 
-	if a.editMode {
+	if a.roadMaskMode {
+		a.drawRoadMaskEditorHUD(w, h)
+	} else if a.editMode {
 		a.drawPropEditorHUD(w, h)
 	} else if !a.mouseCaptured {
 		msg := "MOUSE RELEASED - press TAB to recapture"
@@ -786,6 +808,14 @@ func (a *App) drawHUD() {
 
 func (a *App) drawBox(pos, size rl.Vector3, yawDeg float32, color rl.Color) {
 	rl.DrawModelEx(a.unitCube, pos, rl.NewVector3(0, 1, 0), yawDeg, size, color)
+}
+
+func (a *App) applyMouseCapture() {
+	if a.mouseCaptured {
+		rl.DisableCursor()
+	} else {
+		rl.EnableCursor()
+	}
 }
 
 // drawOrientedBox draws the unit cube with yaw + pitch + roll (degrees).
@@ -1024,6 +1054,10 @@ func (a *App) installLoadedMap() {
 	a.world = nil
 	a.loaded = false
 	a.editMode = false
+	a.roadMaskMode = false
+	a.roadMaskEditor = nil
+	a.roadMaskPreviewPending = false
+	a.roadMaskLastPreviewAt = 0
 	a.selectedProp = -1
 	a.selectedLinearProp = -1
 	a.availablePropAssets = discoverPropAssets(l.mapDef, l.scene.Props, l.scene.LinearProps)

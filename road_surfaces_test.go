@@ -55,6 +55,41 @@ func TestLoadRoadMaskPolygonsGeoTransform(t *testing.T) {
 	}
 }
 
+func TestLoadRoadMaskPolygonsSkipsOpenEdges(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "roads.json")
+	data := []byte(`{
+		"geotiff": {
+			"geo_transform": [100, 0.5, 0, 200, 0, -0.5]
+		},
+		"nodes": [
+			{"id": 1, "x": 0, "y": 0},
+			{"id": 2, "x": 20, "y": 0},
+			{"id": 3, "x": 20, "y": 20}
+		],
+		"edges": [{
+			"id": 7,
+			"node_ids": [1, 2, 3],
+			"segs": [
+				{"is_spline": false, "curb": "hard"},
+				{"is_spline": false, "curb": "soft"}
+			]
+		}]
+	}`)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	terrain := &terrainData{centerWorldX: 100, centerWorldY: 200}
+	polys, err := loadRoadMaskPolygons(path, terrain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(polys) != 0 {
+		t.Fatalf("got %d polygons, want open edges to be ignored", len(polys))
+	}
+}
+
 func TestRoadHeightLayerHardAndSoftCurbs(t *testing.T) {
 	layer := &roadSurfaceLayer{
 		HeightPolygons: []roadHeightPolygon{{

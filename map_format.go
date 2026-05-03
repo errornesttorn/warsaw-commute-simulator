@@ -34,9 +34,12 @@ type mapManifest struct {
 	BuildingGLBs []string          `json:"building_glbs,omitempty"`
 	TreeFiles    []string          `json:"tree_files,omitempty"`
 	ShrubMasks   []string          `json:"shrub_masks,omitempty"`
-	RoadMasks    []string          `json:"road_masks,omitempty"`
-	PropLayers   []string          `json:"prop_layers,omitempty"`
-	ObjectLayers []string          `json:"object_layers,omitempty"`
+	RoadMask     string            `json:"road_mask,omitempty"`
+	// RoadMasks is the legacy multi-mask field. It is accepted only when it
+	// resolves to exactly one file so old single-mask maps can still load.
+	RoadMasks    []string `json:"road_masks,omitempty"`
+	PropLayers   []string `json:"prop_layers,omitempty"`
+	ObjectLayers []string `json:"object_layers,omitempty"`
 }
 
 type mapManifestTile struct {
@@ -59,7 +62,7 @@ type mapDefinition struct {
 	BuildingGLBPaths []string
 	TreePaths        []string
 	ShrubMaskPaths   []string
-	RoadMaskPaths    []string
+	RoadMaskPath     string
 	PropLayerPaths   []string
 	RaylibCenterX    float64
 	RaylibCenterY    float64
@@ -204,11 +207,11 @@ func loadMapDefinition(mapPath string) (*mapDefinition, error) {
 	}
 	mapDef.ShrubMaskPaths = shrubMaskPaths
 
-	roadMaskPaths, err := resolveMapFilePatterns(baseDir, manifest.RoadMasks)
+	roadMaskPath, err := resolveRoadMaskPath(baseDir, manifest.RoadMask, manifest.RoadMasks)
 	if err != nil {
-		return nil, fmt.Errorf("resolve road mask files: %w", err)
+		return nil, fmt.Errorf("resolve road mask file: %w", err)
 	}
-	mapDef.RoadMaskPaths = roadMaskPaths
+	mapDef.RoadMaskPath = roadMaskPath
 
 	propLayerEntries := append([]string(nil), manifest.PropLayers...)
 	propLayerEntries = append(propLayerEntries, manifest.ObjectLayers...)
@@ -269,6 +272,31 @@ func resolveMapFilePatterns(baseDir string, entries []string) ([]string, error) 
 	}
 
 	return paths, nil
+}
+
+func resolveRoadMaskPath(baseDir, entry string, legacyEntries []string) (string, error) {
+	entry = strings.TrimSpace(entry)
+	if entry != "" {
+		if hasGlobMeta(entry) {
+			return "", fmt.Errorf("road_mask must name one file, not a glob: %s", entry)
+		}
+		if filepath.IsAbs(entry) {
+			return filepath.Clean(entry), nil
+		}
+		return filepath.Clean(filepath.Join(baseDir, entry)), nil
+	}
+
+	legacyPaths, err := resolveMapFilePatterns(baseDir, legacyEntries)
+	if err != nil {
+		return "", err
+	}
+	if len(legacyPaths) > 1 {
+		return "", fmt.Errorf("legacy road_masks resolved to %d files; use road_mask with one file", len(legacyPaths))
+	}
+	if len(legacyPaths) == 1 {
+		return legacyPaths[0], nil
+	}
+	return "", nil
 }
 
 func hasGlobMeta(path string) bool {
