@@ -56,11 +56,11 @@ func (v cameraVisibility) sphereVisible(center rl.Vector3, radius float32) bool 
 		return false
 	}
 	x := float32(math.Abs(float64(dotVec3(toCenter, v.right))))
-	if x > max32(depth, 0)*v.tanX+radius {
+	if x > max32(depth, 0)*v.tanX+radius*float32(math.Sqrt(float64(1+v.tanX*v.tanX))) {
 		return false
 	}
 	y := float32(math.Abs(float64(dotVec3(toCenter, v.up))))
-	return y <= max32(depth, 0)*v.tanY+radius
+	return y <= max32(depth, 0)*v.tanY+radius*float32(math.Sqrt(float64(1+v.tanY*v.tanY)))
 }
 
 func vec3LengthSquared(v rl.Vector3) float32 {
