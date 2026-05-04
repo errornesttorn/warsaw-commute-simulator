@@ -1734,15 +1734,15 @@ func (ed *roadMaskEditor) helpText() string {
 		if ed.drawing {
 			return "MASK | LMB endpoint | Z/L line | C spline | H hard | F soft | aim start to close | RMB undo | Enter finish | Esc cancel"
 		}
-		return "MASK | LMB start | G draw | V edit | R delete | X cut | Z/L line | C spline | H hard | F soft | Tab pointer | Ctrl+S save | F4 exit"
+		return "MASK | LMB start | G draw | V edit | R delete | X cut | Z/L line | C spline | H hard | F soft | Tab pointer | Ctrl+S save | 1 exit"
 	case roadMaskToolEdit:
-		return "MASK EDIT | LMB select/drag node or spline handle | Z/L line | C spline | H hard | F soft | Delete straighten/remove | Tab pointer | F4 exit"
+		return "MASK EDIT | LMB select/drag node or spline handle | Z/L line | C spline | H hard | F soft | Delete straighten/remove | Tab pointer | 1 exit"
 	case roadMaskToolDelete:
-		return "MASK DELETE | LMB node or edge | G draw | V edit | X cut | Tab pointer | Ctrl+S save | F4 exit"
+		return "MASK DELETE | LMB node or edge | G draw | V edit | X cut | Tab pointer | Ctrl+S save | 1 exit"
 	case roadMaskToolCut:
-		return "MASK CUT | LMB edge to split | G draw | V edit | R delete | Tab pointer | Ctrl+S save | F4 exit"
+		return "MASK CUT | LMB edge to split | G draw | V edit | R delete | Tab pointer | Ctrl+S save | 1 exit"
 	default:
-		return "MASK | F4 exit"
+		return "MASK | 1 exit"
 	}
 }
 

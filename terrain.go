@@ -52,6 +52,7 @@ type terrainData struct {
 	heightMax          float64
 	meshWidth          int
 	meshHeight         int
+	rebuildIdx         int
 	textureWidth       int
 	textureHeight      int
 	worldWest          float64

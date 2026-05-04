@@ -68,6 +68,14 @@ type App struct {
 	roadMaskEditor             *roadMaskEditor
 	roadMaskPreviewPending     bool
 	roadMaskLastPreviewAt      float64
+	geometryMode               bool
+	geometryTool               geometryEditTool
+	geometryBrushSize          float32
+	geometryTargetElev         float64
+	geometryHasTargetElev      bool
+	geometryDirty              bool
+	geometryStatus             string
+	geometryStatusUntil        float64
 	propTool                   propEditTool
 	selectedProp               int
 	selectedLinearProp         int
@@ -162,6 +170,7 @@ func main() {
 		currentPropScale:     1,
 		currentLinearScale:   1,
 		currentLinearSpacing: defaultLinearSpacingM,
+		geometryBrushSize:    defaultGeometryBrushSize,
 		spectatedCarID:       noSpectatedCarID,
 	}
 	defer rl.UnloadModel(app.unitCube)
@@ -203,7 +212,7 @@ func (a *App) update() {
 		return
 	}
 
-	if rl.IsKeyPressed(rl.KeyTab) && !a.editMode {
+	if rl.IsKeyPressed(rl.KeyTab) && !a.editMode && !a.geometryMode {
 		a.mouseCaptured = !a.mouseCaptured
 		a.applyMouseCapture()
 	}
@@ -224,18 +233,52 @@ func (a *App) update() {
 		a.showVRAM = !a.showVRAM
 	}
 
-	if rl.IsKeyPressed(rl.KeyF2) {
-		if a.roadMaskMode {
-			a.toggleRoadMaskEditor()
-		}
-		a.togglePropEditor()
-	}
-
-	if rl.IsKeyPressed(rl.KeyF4) {
+	if rl.IsKeyPressed(rl.KeyOne) {
 		if a.editMode {
 			a.togglePropEditor()
 		}
-		a.toggleRoadMaskEditor()
+		if a.roadMaskMode {
+			a.toggleRoadMaskEditor()
+		}
+		if a.geometryMode {
+			a.toggleGeometryEditor()
+		}
+	}
+
+	if rl.IsKeyPressed(rl.KeyTwo) {
+		if a.roadMaskMode {
+			a.toggleRoadMaskEditor()
+		}
+		if a.geometryMode {
+			a.toggleGeometryEditor()
+		}
+		if !a.editMode {
+			a.togglePropEditor()
+		}
+	}
+
+	if rl.IsKeyPressed(rl.KeyThree) {
+		if a.editMode {
+			a.togglePropEditor()
+		}
+		if a.geometryMode {
+			a.toggleGeometryEditor()
+		}
+		if !a.roadMaskMode {
+			a.toggleRoadMaskEditor()
+		}
+	}
+
+	if rl.IsKeyPressed(rl.KeyFour) {
+		if a.editMode {
+			a.togglePropEditor()
+		}
+		if a.roadMaskMode {
+			a.toggleRoadMaskEditor()
+		}
+		if !a.geometryMode {
+			a.toggleGeometryEditor()
+		}
 	}
 
 	if a.editMode {
@@ -243,6 +286,13 @@ func (a *App) update() {
 		stepStart := time.Now()
 		a.updatePropEditor()
 		a.profiler.record("prop editor update", time.Since(stepStart))
+	}
+
+	if a.geometryMode {
+		a.spectatedCarID = noSpectatedCarID
+		stepStart := time.Now()
+		a.updateGeometryEditor(dt)
+		a.profiler.record("geometry editor update", time.Since(stepStart))
 	}
 
 	if a.roadMaskMode {
@@ -258,7 +308,7 @@ func (a *App) update() {
 		a.profiler.record("simulation step", time.Since(stepStart))
 	}
 
-	if a.loaded && !a.editMode && !a.roadMaskMode && !exitedSpectating && a.spectatedCarID == noSpectatedCarID && rl.IsMouseButtonPressed(rl.MouseLeftButton) {
+	if a.loaded && !a.editMode && !a.roadMaskMode && !a.geometryMode && !exitedSpectating && a.spectatedCarID == noSpectatedCarID && rl.IsMouseButtonPressed(rl.MouseLeftButton) {
 		stepStart := time.Now()
 		if carID := a.pickCar(a.buildCamera()); carID != noSpectatedCarID {
 			a.spectatedCarID = carID
@@ -297,7 +347,7 @@ func (a *App) update() {
 	if shiftDown {
 		speed *= sprintMult
 	}
-	if a.editMode || a.roadMaskMode {
+	if a.editMode || a.roadMaskMode || a.geometryMode {
 		speed *= 0.25
 	}
 
@@ -305,7 +355,7 @@ func (a *App) update() {
 		a.camPos = addVec3(a.camPos, scaleVec3(fwd, speed*dt))
 	}
 	ctrlDown := rl.IsKeyDown(rl.KeyLeftControl) || rl.IsKeyDown(rl.KeyRightControl)
-	if rl.IsKeyDown(rl.KeyS) && !(a.editMode && ctrlDown) {
+	if rl.IsKeyDown(rl.KeyS) && !((a.editMode || a.geometryMode) && ctrlDown) {
 		a.camPos = addVec3(a.camPos, scaleVec3(fwd, -speed*dt))
 	}
 	if rl.IsKeyDown(rl.KeyA) {
@@ -324,6 +374,11 @@ func (a *App) update() {
 	stepStart = time.Now()
 	pumpTerrainStreaming(a.terrain, a.camPos.X, a.camPos.Z)
 	a.profiler.record("terrain streaming", time.Since(stepStart))
+	if a.geometryMode {
+		stepStart = time.Now()
+		a.pumpGeometryTileRebuilds()
+		a.profiler.record("geometry mesh rebuild", time.Since(stepStart))
+	}
 	stepStart = time.Now()
 	pumpBuildingStreaming(a.objects, a.camPos.X, a.camPos.Z)
 	a.profiler.record("building streaming", time.Since(stepStart))
@@ -389,6 +444,11 @@ func (a *App) draw() {
 		stepStart = time.Now()
 		a.drawRoadMaskEditor3D(camera)
 		a.profiler.record("draw road editor", time.Since(stepStart))
+	}
+	if a.geometryMode {
+		stepStart = time.Now()
+		a.drawGeometryEditor3D()
+		a.profiler.record("draw geometry editor", time.Since(stepStart))
 	}
 
 	stepStart = time.Now()
@@ -793,13 +853,15 @@ func (a *App) drawHUD() {
 		rl.DrawLine(cx, cy-10, cx, cy+10, rl.White)
 	}
 
-	helpText := "TAB: toggle mouse | Ctrl+O: open | WASD+E/Q: fly | LMB car: spectate | Space: pause | P: traffic geometry | F2: props | F3: vram | F11: fullscreen | Shift: sprint"
+	helpText := "TAB: toggle mouse | Ctrl+O: open | WASD+E/Q: fly | LMB car: spectate | Space: pause | P: traffic geometry | 1 none | 2 props | 3 mask | 4 geometry | F3: vram | F11: fullscreen | Shift: sprint"
 	if a.roadMaskMode && a.roadMaskEditor != nil {
 		helpText = a.roadMaskEditor.helpText()
 	} else if a.editMode {
-		helpText = "PROP EDIT | click asset | 1 prop | 2 select | 3 linear | LMB action | RMB drag rotate | [/]/R rotate | ,/. spacing | Ctrl+S save"
+		helpText = "PROP EDIT | click asset | 1 exit | B prop | N select | M linear | LMB action | RMB drag rotate | [/]/R rotate | ,/. spacing | Ctrl+S save"
+	} else if a.geometryMode {
+		helpText = "GEOMETRY EDIT | 1 exit | B raise/lower | N level | M smooth | LMB apply | RMB lower/sample | Ctrl+S save"
 	} else if a.spectatedCarID != noSpectatedCarID {
-		helpText = "SPECTATING CAR | Shift: exit | Ctrl+O: open | Space: pause | P: traffic geometry | F3: vram | F11: fullscreen"
+		helpText = "SPECTATING CAR | Shift: exit | Ctrl+O: open | Space: pause | P: traffic geometry | 2 props | 3 mask | 4 geometry | F3: vram | F11: fullscreen"
 	}
 	rl.DrawText(helpText, 8, h-24, 14, rl.LightGray)
 
@@ -840,6 +902,8 @@ func (a *App) drawHUD() {
 		a.drawRoadMaskEditorHUD(w, h)
 	} else if a.editMode {
 		a.drawPropEditorHUD(w, h)
+	} else if a.geometryMode {
+		a.drawGeometryEditorHUD(w, h)
 	} else if !a.mouseCaptured {
 		msg := "MOUSE RELEASED - press TAB to recapture | MMB drag to rotate"
 		rl.DrawText(msg, w/2-int32(rl.MeasureText(msg, 16))/2, 8, 16, rl.Orange)
@@ -1137,6 +1201,9 @@ func (a *App) installLoadedMap() {
 	a.roadMaskEditor = nil
 	a.roadMaskPreviewPending = false
 	a.roadMaskLastPreviewAt = 0
+	a.geometryMode = false
+	a.geometryDirty = false
+	a.geometryHasTargetElev = false
 	a.selectedProp = -1
 	a.selectedLinearProp = -1
 	a.availablePropAssets = discoverPropAssets(l.mapDef, l.scene.Props, l.scene.LinearProps)
@@ -1162,7 +1229,7 @@ func (a *App) installLoadedMap() {
 	cx := a.terrain.position.X + a.terrain.widthMeters*0.5
 	cz := a.terrain.position.Z + a.terrain.depthMeters*0.5
 	ground := terrainHeightAtLocal(a.terrain, cx, cz)
-	a.camPos = rl.NewVector3(cx, ground+80, cz+a.terrain.depthMeters*0.4)
+	a.camPos = rl.NewVector3(cx, ground+80, cz)
 	a.pitch = -35
 	a.yaw = 0
 

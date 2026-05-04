@@ -80,16 +80,16 @@ func (a *App) updatePropEditor() {
 		return
 	}
 
-	if rl.IsKeyPressed(rl.KeyOne) {
+	if rl.IsKeyPressed(rl.KeyB) {
 		a.propTool = propEditToolPlace
 		a.draggingProp = false
 		a.selectedLinearProp = -1
 	}
-	if rl.IsKeyPressed(rl.KeyTwo) {
+	if rl.IsKeyPressed(rl.KeyN) {
 		a.propTool = propEditToolSelect
 		a.draggingProp = false
 	}
-	if rl.IsKeyPressed(rl.KeyThree) {
+	if rl.IsKeyPressed(rl.KeyM) {
 		a.propTool = propEditToolLinear
 		a.draggingProp = false
 		a.selectedProp = -1

@@ -430,6 +430,38 @@ func chooseRaylibCenterZ(mapDef *mapDefinition, minHeight float64) float64 {
 	return minHeight
 }
 
+func writeASC(path string, meta demMetadata, valueFunc func(row, col int) float64) error {
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	writer := bufio.NewWriter(file)
+	fmt.Fprintf(writer, "ncols         %d\n", meta.cols)
+	fmt.Fprintf(writer, "nrows         %d\n", meta.rows)
+	if meta.originIsCenter {
+		fmt.Fprintf(writer, "xllcenter     %.3f\n", meta.xOrigin)
+		fmt.Fprintf(writer, "yllcenter     %.3f\n", meta.yOrigin)
+	} else {
+		fmt.Fprintf(writer, "xllcorner     %.3f\n", meta.xOrigin)
+		fmt.Fprintf(writer, "yllcorner     %.3f\n", meta.yOrigin)
+	}
+	fmt.Fprintf(writer, "cellsize      %.3f\n", meta.cellSize)
+	fmt.Fprintf(writer, "nodata_value  %.1f\n", meta.noData)
+
+	for row := 0; row < meta.rows; row++ {
+		for col := 0; col < meta.cols; col++ {
+			if col > 0 {
+				writer.WriteByte(' ')
+			}
+			writer.WriteString(strconv.FormatFloat(valueFunc(row, col), 'f', 2, 64))
+		}
+		writer.WriteByte('\n')
+	}
+	return writer.Flush()
+}
+
 func readDEMMetadata(path string) (demMetadata, error) {
 	file, err := os.Open(path)
 	if err != nil {

@@ -61,6 +61,7 @@ type terrainTile struct {
 
 	quality       int
 	maxQualityCap int // highest quality tier that has not failed to upload
+	needsRebuild  bool
 }
 
 type terrainStreamResult struct {
@@ -99,54 +100,64 @@ func computeTerrainTileLayouts(t *terrainData, gridN int) []terrainTileLayout {
 	if t == nil || t.meshWidth < 2 || t.meshHeight < 2 || gridN <= 0 {
 		return nil
 	}
+
+	layouts := make([]terrainTileLayout, 0, gridN*gridN)
+	for gz := 0; gz < gridN; gz++ {
+		for gx := 0; gx < gridN; gx++ {
+			if layout, ok := computeTerrainTileLayout(t, gx, gz, gridN); ok {
+				layouts = append(layouts, layout)
+			}
+		}
+	}
+	return layouts
+}
+
+func computeTerrainTileLayout(t *terrainData, gx, gz, gridN int) (terrainTileLayout, bool) {
+	if t == nil || t.meshWidth < 2 || t.meshHeight < 2 || gridN <= 0 || gx < 0 || gz < 0 || gx >= gridN || gz >= gridN {
+		return terrainTileLayout{}, false
+	}
 	meshW := t.meshWidth
 	meshH := t.meshHeight
 	spanX := float64(t.widthMeters)
 	spanZ := float64(t.depthMeters)
 
-	layouts := make([]terrainTileLayout, 0, gridN*gridN)
-	for gz := 0; gz < gridN; gz++ {
-		for gx := 0; gx < gridN; gx++ {
-			x0 := gx * (meshW - 1) / gridN
-			x1 := (gx + 1) * (meshW - 1) / gridN
-			z0 := gz * (meshH - 1) / gridN
-			z1 := (gz + 1) * (meshH - 1) / gridN
-			if gx == gridN-1 {
-				x1 = meshW - 1
-			}
-			if gz == gridN-1 {
-				z1 = meshH - 1
-			}
-			if x1-x0+1 < 2 || z1-z0+1 < 2 {
-				continue
-			}
-
-			tileSpanX := float32(float64(x1-x0) / float64(meshW-1) * spanX)
-			tileSpanZ := float32(float64(z1-z0) / float64(meshH-1) * spanZ)
-			posX := t.position.X + float32(float64(x0)/float64(meshW-1)*spanX)
-			posZ := t.position.Z + float32(float64(z0)/float64(meshH-1)*spanZ)
-
-			layouts = append(layouts, terrainTileLayout{
-				gridX:     gx,
-				gridZ:     gz,
-				x0:        x0,
-				x1:        x1,
-				z0:        z0,
-				z1:        z1,
-				tileSpanX: tileSpanX,
-				tileSpanZ: tileSpanZ,
-				posX:      posX,
-				posZ:      posZ,
-				worldWest: t.worldWest + float64(x0)/float64(meshW-1)*(t.worldEast-t.worldWest),
-				worldEast: t.worldWest + float64(x1)/float64(meshW-1)*(t.worldEast-t.worldWest),
-				worldNorth: t.worldNorth -
-					float64(z0)/float64(meshH-1)*(t.worldNorth-t.worldSouth),
-				worldSouth: t.worldNorth -
-					float64(z1)/float64(meshH-1)*(t.worldNorth-t.worldSouth),
-			})
-		}
+	x0 := gx * (meshW - 1) / gridN
+	x1 := (gx + 1) * (meshW - 1) / gridN
+	z0 := gz * (meshH - 1) / gridN
+	z1 := (gz + 1) * (meshH - 1) / gridN
+	if gx == gridN-1 {
+		x1 = meshW - 1
 	}
-	return layouts
+	if gz == gridN-1 {
+		z1 = meshH - 1
+	}
+	if x1-x0+1 < 2 || z1-z0+1 < 2 {
+		return terrainTileLayout{}, false
+	}
+
+	tileSpanX := float32(float64(x1-x0) / float64(meshW-1) * spanX)
+	tileSpanZ := float32(float64(z1-z0) / float64(meshH-1) * spanZ)
+	posX := t.position.X + float32(float64(x0)/float64(meshW-1)*spanX)
+	posZ := t.position.Z + float32(float64(z0)/float64(meshH-1)*spanZ)
+
+	return terrainTileLayout{
+		gridX:     gx,
+		gridZ:     gz,
+		x0:        x0,
+		x1:        x1,
+		z0:        z0,
+		z1:        z1,
+		tileSpanX: tileSpanX,
+		tileSpanZ: tileSpanZ,
+		posX:      posX,
+		posZ:      posZ,
+		worldWest: t.worldWest + float64(x0)/float64(meshW-1)*(t.worldEast-t.worldWest),
+		worldEast: t.worldWest + float64(x1)/float64(meshW-1)*(t.worldEast-t.worldWest),
+		worldNorth: t.worldNorth -
+			float64(z0)/float64(meshH-1)*(t.worldNorth-t.worldSouth),
+		worldSouth: t.worldNorth -
+			float64(z1)/float64(meshH-1)*(t.worldNorth-t.worldSouth),
+	}, true
 }
 
 func buildTerrainTiles(t *terrainData, baseMosaic *image.RGBA, gridN int) []*terrainTile {
@@ -311,6 +322,29 @@ func buildTerrainTileMesh(t *terrainData, x0, x1, z0, z1 int, tileSpanX, tileSpa
 	mesh.Texcoords = nil
 	mesh.Indices = terrainMeshIndexSentinel()
 	return mesh, meshBytes
+}
+
+func (tile *terrainTile) rebuildMesh(t *terrainData) {
+	if tile == nil || t == nil || t.meshWidth < 2 || t.meshHeight < 2 {
+		return
+	}
+	if layout, ok := computeTerrainTileLayout(t, tile.gridX, tile.gridZ, terrainTileGridN); ok {
+		mesh, meshBytes := buildTerrainTileMesh(t, layout.x0, layout.x1, layout.z0, layout.z1, layout.tileSpanX, layout.tileSpanZ)
+		freeTerrainMeshIndexSentinel(tile.mesh.Indices)
+		tile.mesh.Indices = nil
+		if tile.mesh.VaoID != 0 || tile.mesh.VboID != nil {
+			rl.UnloadMesh(&tile.mesh)
+		}
+		tile.mesh = mesh
+		tile.meshBytes = meshBytes
+		tile.position.Y = t.position.Y
+		tile.centerLocalX = layout.posX + layout.tileSpanX*0.5
+		tile.centerLocalZ = layout.posZ + layout.tileSpanZ*0.5
+		tile.cullRadius = float32(math.Sqrt(float64(layout.tileSpanX*layout.tileSpanX+layout.tileSpanZ*layout.tileSpanZ+t.heightMeters*t.heightMeters))) * 0.5
+		tile.needsRebuild = false
+		return
+	}
+	tile.needsRebuild = false
 }
 
 func drawTerrainTiles(t *terrainData, camera rl.Camera) {
