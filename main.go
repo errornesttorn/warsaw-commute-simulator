@@ -793,41 +793,22 @@ func vec2Normalize(v simpkg.Vec2) simpkg.Vec2 {
 	return vec2Scale(v, inv)
 }
 
+func pedestrianBodyPose(paths []simpkg.PedestrianPath, ped simpkg.Pedestrian) (pos, heading simpkg.Vec2, ok bool) {
+	return simpkg.PedestrianPose(paths, ped)
+}
+
 func (a *App) drawPedestrians() {
 	skinColor := rl.NewColor(220, 180, 140, 255)
 
 	for _, ped := range a.world.Pedestrians {
-		var px, pz float32
-
-		if ped.TransitionActive {
-			// Quadratic bezier along the crossing arc
-			t := ped.TransitionDistance / ped.TransitionLength
-			if t > 1 {
-				t = 1
-			}
-			t1 := 1 - t
-			px = t1*t1*ped.TransitionP0.X + 2*t*t1*ped.TransitionP1.X + t*t*ped.TransitionP2.X
-			pz = t1*t1*ped.TransitionP0.Y + 2*t*t1*ped.TransitionP1.Y + t*t*ped.TransitionP2.Y
-		} else {
-			if ped.PathIndex < 0 || ped.PathIndex >= len(a.world.PedestrianPaths) {
-				continue
-			}
-			path := a.world.PedestrianPaths[ped.PathIndex]
-			dx := path.P1.X - path.P0.X
-			dz := path.P1.Y - path.P0.Y
-			pathLen := float32(math.Sqrt(float64(dx*dx + dz*dz)))
-			if pathLen < 0.01 {
-				continue
-			}
-			ndx, ndz := dx/pathLen, dz/pathLen
-			// perpendicular (left of direction)
-			perpX, perpZ := -ndz, ndx
-			px = path.P0.X + ndx*ped.Distance + perpX*ped.LateralOffset
-			pz = path.P0.Y + ndz*ped.Distance + perpZ*ped.LateralOffset
+		pos, heading, ok := pedestrianBodyPose(a.world.PedestrianPaths, ped)
+		if !ok {
+			continue
 		}
 
-		center := rl.NewVector3(px, a.groundAt(px, pz)+pedHeight/2, pz)
-		rl.DrawCubeV(center, rl.NewVector3(pedWidth, pedHeight, pedWidth*0.8), skinColor)
+		angle := float32(math.Atan2(float64(heading.X), float64(heading.Y))) * 180 / math.Pi
+		center := rl.NewVector3(pos.X, a.groundAt(pos.X, pos.Y)+pedHeight/2, pos.Y)
+		a.drawBox(center, rl.NewVector3(pedWidth, pedHeight, pedWidth*0.8), angle, skinColor)
 	}
 }
 
