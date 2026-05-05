@@ -93,6 +93,8 @@ type App struct {
 	propStatus                 string
 	propStatusUntil            float64
 	spectatedCarID             int
+	vehicleAssets              map[string]*vehicleAsset
+	vehicleWheelSpin           map[int]float32
 }
 
 type loaderPhase int
@@ -154,6 +156,8 @@ func main() {
 	defer rl.CloseWindow()
 	rl.SetTargetFPS(60)
 	rl.DisableCursor()
+	initModelLightingShader()
+	defer unloadModelLightingShader()
 
 	app := &App{
 		camPos:               rl.NewVector3(0, 10, 0),
@@ -172,8 +176,11 @@ func main() {
 		currentLinearSpacing: defaultLinearSpacingM,
 		geometryBrushSize:    defaultGeometryBrushSize,
 		spectatedCarID:       noSpectatedCarID,
+		vehicleAssets:        map[string]*vehicleAsset{},
+		vehicleWheelSpin:     map[int]float32{},
 	}
 	defer rl.UnloadModel(app.unitCube)
+	defer func() { unloadVehicleAssets(app.vehicleAssets) }()
 	defer func() { unloadTerrain(app.terrain) }()
 	defer func() { unloadSceneObjects(app.objects) }()
 
@@ -429,7 +436,7 @@ func (a *App) draw() {
 		a.drawTrafficLights()
 		a.profiler.record("draw traffic lights", time.Since(stepStart))
 		stepStart = time.Now()
-		a.drawCars()
+		a.drawCars(camera)
 		a.profiler.record("draw cars", time.Since(stepStart))
 		stepStart = time.Now()
 		a.drawPedestrians()
@@ -567,10 +574,12 @@ func (a *App) drawTrafficLights() {
 	}
 }
 
-func (a *App) drawCars() {
+func (a *App) drawCars(camera rl.Camera) {
 	allSplines := simpkg.MergedSplines(a.world.Splines, a.world.LaneChangeSplines)
 	blinkOn := int(rl.GetTime()*2)%2 == 0
 	amber := rl.NewColor(255, 165, 0, 255)
+	aspect := float32(rl.GetScreenWidth()) / float32(rl.GetScreenHeight())
+	view := newCameraVisibility(camera, aspect, cameraFar)
 
 	for _, car := range a.world.Cars {
 		frontPos, center, heading, ok := carBodyPose(car, allSplines)
@@ -587,15 +596,26 @@ func (a *App) drawCars() {
 		width := car.Width
 
 		ground := a.groundAt(cx, cz)
+		drawCenter := rl.NewVector3(cx, ground+h*0.5, cz)
+		drawRadius := max32(max32(length, width), h) * 0.65
+		if !view.sphereVisible(drawCenter, drawRadius) {
+			continue
+		}
+		if !a.vehicleWithinDrawDistance(drawCenter) {
+			continue
+		}
 		pitchDeg, rollDeg := a.terrainTilt(cx, cz, hx, hz, length, width)
 
-		c := car.Color
-		a.drawOrientedBox(
-			rl.NewVector3(cx, ground+h/2, cz),
-			rl.NewVector3(width, h, length),
-			angle, pitchDeg, rollDeg,
-			rl.NewColor(c.R, c.G, c.B, 255),
-		)
+		modelLOD := a.vehicleModelLOD(car, drawCenter)
+		if modelLOD == vehicleModelLODNone || !a.drawVehicleModel(car, center, heading, ground, angle, pitchDeg, rollDeg, modelLOD) {
+			c := car.Color
+			a.drawOrientedBox(
+				rl.NewVector3(cx, ground+h/2, cz),
+				rl.NewVector3(width, h, length),
+				angle, pitchDeg, rollDeg,
+				rl.NewColor(c.R, c.G, c.B, 255),
+			)
+		}
 
 		// Trailer
 		if car.Trailer.HasTrailer {
@@ -764,7 +784,7 @@ func carBodyPose(car simpkg.Car, splines []simpkg.Spline) (frontPos, center, hea
 	if vec2LengthSq(vec2Sub(frontPos, car.RearPosition)) <= 1e-9 {
 		heading = splineTangent
 	}
-	center = vec2Scale(vec2Add(frontPos, car.RearPosition), 0.5)
+	center = vehicleBodyCenter(car, frontPos, heading)
 	return frontPos, center, heading, true
 }
 
@@ -1192,6 +1212,7 @@ func (a *App) installLoadedMap() {
 	a.draggingProp = false
 	a.propDirty = false
 	a.spectatedCarID = noSpectatedCarID
+	a.vehicleWheelSpin = map[int]float32{}
 
 	if len(problems) > 0 {
 		fmt.Printf("Map loaded, but scene object load had problems: %v\n", errors.Join(problems...))

@@ -428,6 +428,7 @@ func ensurePropAssetLoaded(mapDef *mapDefinition, assets map[string]*propAsset, 
 	if !rl.IsModelValid(model) {
 		return nil, fmt.Errorf("load prop asset %s: invalid model", asset)
 	}
+	applyModelLightingToModel(&model)
 
 	bounds := rl.GetModelBoundingBox(model)
 	pa := &propAsset{
