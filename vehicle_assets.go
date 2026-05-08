@@ -19,8 +19,8 @@ const (
 	vehicleWheelFile       = "wheel.glb"
 	minVehicleWheelRadiusM = float32(0.05)
 
-	vehicleModelFullDistanceM = float32(55)
-	vehicleModelBodyDistanceM = float32(400)
+	vehicleModelFullDistanceM = float32(150)
+	vehicleModelBodyDistanceM = float32(500)
 )
 
 type vehicleModelLOD int
